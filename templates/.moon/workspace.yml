@@ -1,0 +1,17 @@
+# moon workspace template. Copy to <repo>/.moon/workspace.yml.
+$schema: 'https://moonrepo.dev/schemas/workspace.json'
+
+projects:
+  globs:
+    - 'crates/*'
+    - 'services/*'
+
+vcs:
+  client: 'git'
+  defaultBranch: 'main'
+
+remote:
+  # Shared bazel-remote (namespace ci). Runners on hostNetwork use the ClusterIP; pods use bazel-remote.ci.svc.cluster.local.
+  host: 'grpc://<bazel-remote>:9092'
+  cache:
+    compression: 'zstd'

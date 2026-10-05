@@ -1,0 +1,5 @@
+# proto toolchain pins template. Copy to <repo>/.prototools.
+# Placeholders: set the versions the repo actually needs.
+go = "1.24"
+rust = "stable"
+node = "22"

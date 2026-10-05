@@ -1,0 +1,28 @@
+# Go project template. Copy to <project>/moon.yml.
+language: 'go'
+layer: 'application'
+
+fileGroups:
+  sources:
+    - '**/*.go'
+    - 'go.mod'
+    - 'go.sum'
+
+tasks:
+  test:
+    # Go flags in space form: moon passes -flag=value as two arguments.
+    command: 'go test -covermode atomic -coverprofile coverage.out ./...'
+    inputs:
+      - '@group(sources)'
+    outputs:
+      - 'coverage.out'
+  vet:
+    command: 'go vet ./...'
+    inputs:
+      - '@group(sources)'
+  build:
+    command: 'go build -o bin/app ./...'
+    inputs:
+      - '@group(sources)'
+    outputs:
+      - 'bin/app'

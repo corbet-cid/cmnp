@@ -1,0 +1,26 @@
+# Rust project template. Copy to <project>/moon.yml.
+language: 'rust'
+layer: 'library'
+
+fileGroups:
+  sources:
+    - 'src/**/*'
+    - 'tests/**/*'
+    - 'Cargo.toml'
+    - '/Cargo.lock'
+
+tasks:
+  test:
+    command: 'cargo test --locked'
+    inputs:
+      - '@group(sources)'
+  clippy:
+    command: 'cargo clippy --locked --all-targets -- -D warnings'
+    inputs:
+      - '@group(sources)'
+  build:
+    command: 'cargo build --locked --release'
+    inputs:
+      - '@group(sources)'
+    outputs:
+      - '/target/release'
