@@ -265,8 +265,10 @@ fn tool_identity(
             }
         },
         "javascript" => {
-            probes.push(argv(&["node", "--version"]));
             let manager = check.manager.as_deref().unwrap_or("npm");
+            if manager != "deno" {
+                probes.push(argv(&["node", "--version"]));
+            }
             probes.push(vec![
                 javascript_executable(manager, cfg!(windows)).to_owned(),
                 "--version".into(),

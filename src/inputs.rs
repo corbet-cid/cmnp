@@ -250,10 +250,59 @@ pub fn source_digest(root: &Path, check: &Check, env: &Environment) -> Result<St
             "**/package-lock.json",
             "**/pnpm-lock.yaml",
             "**/bun.lock*",
+            "**/deno.lock",
+            "**/deno.json*",
+            "**/bunfig.toml",
             "**/.npmrc",
             "**/pnpm-workspace.yaml",
         ],
         "nix" => &["**/*"],
+        // A narrow custom-command source declaration must not omit dependency
+        // resolution or compiler configuration for any supported ecosystem.
+        "commands" => &[
+            "**/Cargo.toml",
+            "**/Cargo.lock",
+            "**/.cargo/**",
+            "**/rust-toolchain*",
+            "**/go.mod",
+            "**/go.sum",
+            "**/go.work",
+            "**/go.work.sum",
+            "**/package.json",
+            "**/package-lock.json",
+            "**/npm-shrinkwrap.json",
+            "**/pnpm-lock.yaml",
+            "**/pnpm-workspace.yaml",
+            "**/bun.lock*",
+            "**/bunfig.toml",
+            "**/yarn.lock",
+            "**/.yarnrc*",
+            "**/.npmrc",
+            "**/deno.json*",
+            "**/deno.lock",
+            "**/tsconfig*.json",
+            "**/pyproject.toml",
+            "**/uv.lock",
+            "**/requirements*.txt",
+            "**/poetry.lock",
+            "**/Pipfile*",
+            "**/.python-version",
+            "**/flake.nix",
+            "**/flake.lock",
+            "**/typst.toml",
+            "**/CMakeLists.txt",
+            "**/CMakePresets.json",
+            "**/conan.lock",
+            "**/vcpkg.json",
+            "**/vcpkg-configuration.json",
+            "**/Dockerfile*",
+            "**/.dockerignore",
+            "**/docker-bake.*",
+            "**/.prototools",
+            "**/.tool-versions",
+            "**/buf.lock",
+            "**/.terraform.lock.hcl",
+        ],
         _ => &[],
     };
     for path in [
@@ -322,6 +371,7 @@ pub fn lock_digest(root: &Path, check: &Check) -> Result<String> {
             "npm" => &["package-lock.json"],
             "pnpm" => &["pnpm-lock.yaml"],
             "bun" => &["bun.lock", "bun.lockb"],
+            "deno" => &["deno.lock"],
             _ => return Err(failure("Unsupported package manager")),
         },
         _ => return Ok(format!("{:x}", Sha256::digest(b"no-dependency-lock"))),
@@ -354,6 +404,20 @@ pub const SEMANTIC_ENV: &[&str] = &[
     "NIX_CONFIG",
     "NODE_OPTIONS",
     "NODE_ENV",
+    "GOOS",
+    "GOARCH",
+    "GOAMD64",
+    "GOARM",
+    "GOFLAGS",
+    "GOEXPERIMENT",
+    "GOTOOLCHAIN",
+    "CGO_ENABLED",
+    "CGO_CFLAGS",
+    "CGO_CPPFLAGS",
+    "CGO_CXXFLAGS",
+    "CGO_LDFLAGS",
+    "PYTHONHASHSEED",
+    "PYTHONOPTIMIZE",
     "TZ",
     "LANG",
     "LC_ALL",
@@ -403,6 +467,33 @@ pub fn execution_environment(check: &Check, env: &Environment) -> Environment {
         "RUSTC_WRAPPER",
         "SCCACHE_DIR",
         "SCCACHE_CACHE_SIZE",
+        // Native caches validate their own entries. Their location must reach
+        // checked commands without introducing machine paths into content keys.
+        "CCACHE_DIR",
+        "GOCACHE",
+        "GOMODCACHE",
+        "npm_config_cache",
+        "NPM_CONFIG_CACHE",
+        "npm_config_store_dir",
+        "pnpm_config_store_dir",
+        "PNPM_HOME",
+        "YARN_CACHE_FOLDER",
+        "UV_CACHE_DIR",
+        "UV_PYTHON_INSTALL_DIR",
+        "PIP_CACHE_DIR",
+        "BUN_INSTALL_CACHE_DIR",
+        "BUN_RUNTIME_TRANSPILER_CACHE_PATH",
+        "DENO_DIR",
+        "NODE_COMPILE_CACHE",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "PUPPETEER_CACHE_DIR",
+        "TYPST_PACKAGE_CACHE_PATH",
+        "WASM_PACK_CACHE",
+        "XDG_CACHE_HOME",
+        "NIX_CACHE_HOME",
+        "NIX_REMOTE",
+        "BUILDKIT_HOST",
+        "TF_PLUGIN_CACHE_DIR",
         "SSL_CERT_FILE",
         "NIX_SSL_CERT_FILE",
         "NIX_LD",
@@ -521,6 +612,78 @@ mod tests {
         assert_eq!(
             semantic_environment(&check, &env)["FEATURE"].as_deref(),
             Some("yes")
+        );
+    }
+
+    #[test]
+    fn custom_commands_cannot_hide_dependency_locks_with_narrow_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("main.txt"), "source").unwrap();
+        let check = Check {
+            kind: "commands".into(),
+            cache_inputs: Some(vec!["main.txt".into()]),
+            ..Check::default()
+        };
+        let env = std::env::vars_os().collect();
+        let mut previous = source_digest(root.path(), &check, &env).unwrap();
+        for lock in [
+            "go.sum",
+            "uv.lock",
+            "deno.lock",
+            "pnpm-lock.yaml",
+            "flake.lock",
+            "Cargo.lock",
+            "conan.lock",
+            "buf.lock",
+            ".prototools",
+        ] {
+            fs::write(root.path().join(lock), "locked content").unwrap();
+            let current = source_digest(root.path(), &check, &env).unwrap();
+            assert_ne!(previous, current, "{lock} must affect the key");
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn native_cache_locations_are_forwarded_without_invalidating_results() {
+        let check = Check::default();
+        for name in [
+            "GOCACHE",
+            "GOMODCACHE",
+            "CCACHE_DIR",
+            "npm_config_cache",
+            "npm_config_store_dir",
+            "UV_CACHE_DIR",
+            "PIP_CACHE_DIR",
+            "BUN_INSTALL_CACHE_DIR",
+            "DENO_DIR",
+            "NODE_COMPILE_CACHE",
+            "PLAYWRIGHT_BROWSERS_PATH",
+            "TYPST_PACKAGE_CACHE_PATH",
+            "WASM_PACK_CACHE",
+            "NIX_CACHE_HOME",
+            "PROTO_HOME",
+            "RUSTUP_HOME",
+        ] {
+            let first = Environment::from([(name.into(), "/cache/one".into())]);
+            let second = Environment::from([(name.into(), "/cache/two".into())]);
+            assert_eq!(
+                value(&execution_environment(&check, &first), name).as_deref(),
+                Some("/cache/one")
+            );
+            assert_eq!(
+                semantic_environment(&check, &first),
+                semantic_environment(&check, &second)
+            );
+        }
+        let native = Environment::from([("GOFLAGS".into(), "-race".into())]);
+        assert_ne!(
+            semantic_environment(&check, &native),
+            semantic_environment(&check, &Environment::new())
+        );
+        assert_eq!(
+            value(&execution_environment(&check, &native), "GOFLAGS").as_deref(),
+            Some("-race")
         );
     }
 }
