@@ -18,10 +18,19 @@ variables:
   CI_MEMORY_MB: {default: "8192"}
   CI_MEMORY_PER_JOB_MB: {default: "2048"}
 steps:
+  - name: native-status-pending
+    image: bash
+    commands:
+      - |
+        set -eu
+        if [ -n "${CCID_STATUS_CONFIG:-}" ]; then
+          printf '%s  %s\n' "$CCID_STATUS_BINARY_SHA256" "$CCID_STATUS_BINARY" | sha256sum --check --strict
+          "$CCID_STATUS_BINARY" --commit "$CI_COMMIT_SHA" --name "ccid/$(printf '%s' "$CCID_JOB_REQUEST" | jq -er .job)" --url "$CI_PIPELINE_URL" --started "$CI_PIPELINE_CREATED" --state pending
+        fi
   - name: repository-job
     image: bash
     environment:
-      CCID_REVISION: '81ebac8e86e20bc93b69d5e912bbcb0c0d036d58'
+      CCID_REVISION: '3caf43366cf4dd751e5283c246e4b9d6f0e3f8cd'
     commands:
       - |
         set -eu
@@ -31,3 +40,16 @@ steps:
         trap 'rm -f -- "$request_file"' EXIT
         printf '%s\n' "$CCID_JOB_REQUEST" > "$request_file"
         "$CI_TOOL_BINARY" execute-job --request "$request_file" --expect-commit "$CI_COMMIT_SHA"
+  - name: native-status-complete
+    image: bash
+    when:
+      - status: [success, failure]
+    commands:
+      - |
+        set -eu
+        if [ -n "${CCID_STATUS_CONFIG:-}" ]; then
+          printf '%s  %s\n' "$CCID_STATUS_BINARY_SHA256" "$CCID_STATUS_BINARY" | sha256sum --check --strict
+          state=failure
+          if [ "$CI_PIPELINE_STATUS" = success ]; then state=success; fi
+          "$CCID_STATUS_BINARY" --commit "$CI_COMMIT_SHA" --name "ccid/$(printf '%s' "$CCID_JOB_REQUEST" | jq -er .job)" --url "$CI_PIPELINE_URL" --started "$CI_PIPELINE_CREATED" --state "$state"
+        fi
