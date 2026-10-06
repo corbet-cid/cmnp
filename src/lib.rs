@@ -14,7 +14,9 @@ pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub type Environment = BTreeMap<OsString, OsString>;
 
+pub mod content_key;
 pub mod executor;
+pub mod inputs;
 mod process;
 
 fn failure(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
