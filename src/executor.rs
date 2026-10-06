@@ -64,6 +64,7 @@ pub struct Check {
 /// Validated execution request. The caller owns manifest parsing, check
 /// selection and the cached-plan event; this request carries everything moon
 /// needs to reproduce the run.
+#[derive(Clone)]
 pub struct Request {
     pub repo: PathBuf,
     pub project: String,
@@ -105,11 +106,181 @@ pub fn validate_selection(checks: &BTreeMap<String, Check>, selected: &[String])
 
 /// Run the selected checks through moon so unchanged inputs reuse earlier results.
 pub fn execute(request: &Request) -> Result<()> {
-    validate_selection(&request.checks, &request.selected)?;
+    for name in &request.selected {
+        if !request.checks.contains_key(name) {
+            return Err(failure(format!("Selected check {name} is not declared")));
+        }
+    }
     if request.plan {
         return Ok(());
     }
-    shared_cache::execute(request)
+    let timeout = value(&request.environment, "CI_TIMEOUT")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2700);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(timeout))
+        .ok_or_else(|| failure("Cache deadline overflow"))?;
+    let mut measurements = Vec::new();
+    let mut bypassed = Vec::new();
+    for name in &request.selected {
+        let mut one = request.clone();
+        one.selected = vec![name.clone()];
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(failure("Check deadline exceeded"));
+        }
+        one.environment.insert(
+            "CI_TIMEOUT".into(),
+            remaining.as_secs().max(1).to_string().into(),
+        );
+        let reason = cache_bypass_reason(&one);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(failure("Check deadline exceeded"));
+        }
+        one.environment.insert(
+            "CI_TIMEOUT".into(),
+            remaining.as_secs().max(1).to_string().into(),
+        );
+        if let Some(reason) = reason {
+            event(
+                json!({"event":"cache-bypass","check":name,"reason":reason,"execution":"uncached"}),
+            );
+            bypassed.push(json!({"check":name,"reason":reason}));
+            // Preserve the ordinary check environment and product exit status.
+            // Never retry here after a cache transaction has begun executing.
+            let mut env = one.environment.clone();
+            for key in [
+                "CCID_RESULT_CACHE",
+                "CCID_CACHE_CHILD",
+                "CCID_CACHE_REPLAY_ONLY",
+                "CCID_TOOL_IDENTITY",
+            ] {
+                env.remove(std::ffi::OsStr::new(key));
+            }
+            let receipt_relative = format!("{RESULTS}/{name}.jsonl");
+            safe_relative(Path::new(&receipt_relative))?;
+            let receipt = one.repo.join(receipt_relative);
+            fs::create_dir_all(
+                receipt
+                    .parent()
+                    .ok_or_else(|| failure("Missing receipt directory"))?,
+            )?;
+            fs::write(
+                &receipt,
+                format!(
+                    "{}\n",
+                    json!({"event":"cache-bypass","check":name,"reason":reason,"execution":"uncached"})
+                ),
+            )?;
+            env.insert("CCID_RECEIPT".into(), receipt.into_os_string());
+            Runner::new(one.repo.clone(), env, remaining)?.run(
+                &[
+                    one.tool.clone(),
+                    "check".into(),
+                    "--repo".into(),
+                    ".".into(),
+                    "--manifest".into(),
+                    one.manifest_arg.clone(),
+                    "--check".into(),
+                    name.clone(),
+                ],
+                false,
+            )?;
+        } else {
+            shared_cache::execute(&one)?;
+            let metrics: serde_json::Value =
+                serde_json::from_slice(&fs::read(one.repo.join(".ccid/cache-metrics.json"))?)?;
+            measurements.extend(
+                metrics["checks"]
+                    .as_array()
+                    .ok_or_else(|| failure("Missing cache measurements"))?
+                    .iter()
+                    .cloned(),
+            );
+        }
+    }
+    let hits = measurements.iter().filter(|r| r["computed"] == 0).count();
+    let requests = measurements.len();
+    let summary = json!({"event":"cache-run","checks":measurements,"bypassed":bypassed,
+        "result":{"hits":hits,"requests":requests,"hit_rate":if requests == 0 { None } else { Some(hits as f64 / requests as f64) }},
+        "compile":null,"nix_eval":null,"fetch":null});
+    fs::create_dir_all(request.repo.join(".ccid"))?;
+    fs::write(
+        request.repo.join(".ccid/cache-metrics.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    event(summary);
+    Ok(())
+}
+
+fn supported_moon(version: &str) -> bool {
+    version.trim() == "moon 2.4.6" || version.starts_with("moon 2.5.")
+}
+
+/// Cache availability is a preflight decision, never a reason to skip product
+/// checks or to replay an already-started computation after an error.
+fn cache_bypass_reason(request: &Request) -> Option<String> {
+    if request.force {
+        return Some("uncached execution explicitly requested".into());
+    }
+    let check = &request.checks[&request.selected[0]];
+    if check.cache == Some(false) || check.cache_commit {
+        return Some("check is explicitly not result-cacheable".into());
+    }
+    if matches!(check.kind.as_str(), "commands" | "nix") && !check.cache_pure {
+        return Some("no explicit pure-result contract".into());
+    }
+    if check.kind == "commands" && (check.cache_inputs.is_none() || check.cache_tools.is_empty()) {
+        return Some("no complete input and tool contract".into());
+    }
+    if let Err(error) = validate_selection(&request.checks, &request.selected) {
+        return Some(format!("result-cache contract is unavailable: {error}"));
+    }
+    let Some(root) = value(&request.environment, "CCID_RESULT_CACHE") else {
+        return Some("CCID_RESULT_CACHE is not provisioned".into());
+    };
+    if let Err(error) = crate::content_key::validate_root(Path::new(&root)) {
+        return Some(format!("result-cache storage unavailable: {error}"));
+    }
+    let runner = match Runner::new(
+        request.repo.clone(),
+        request.environment.clone(),
+        Duration::from_secs(30),
+    ) {
+        Ok(runner) => runner,
+        Err(error) => return Some(format!("cache preflight unavailable: {error}")),
+    };
+    if check.kind == "nix" {
+        let clean = request.repo.join(".git").exists()
+            && runner
+                .run(
+                    &argv(&["git", "status", "--porcelain", "--untracked-files=no"]),
+                    true,
+                )
+                .is_ok_and(|status| status.is_empty());
+        if !clean {
+            return Some("Nix result cache requires a committed clean flake".into());
+        }
+    }
+    if let Err(error) = crate::inputs::lock_digest(&request.repo, check) {
+        return Some(format!("dependency lock is not cacheable: {error}"));
+    }
+    if let Err(error) = tool_identity(
+        &runner,
+        check,
+        &request.environment,
+        &request.tool,
+        &request.tool_revision,
+        &mut BTreeMap::new(),
+    ) {
+        return Some(format!("tool identity is not cacheable: {error}"));
+    }
+    match runner.run(&argv(&["moon", "--version"]), true) {
+        Ok(version) if supported_moon(&version) => None,
+        Ok(version) => Some(format!("unsupported result-cache runtime: {version}")),
+        Err(_) => Some("moon is unavailable; running ordinary checks".into()),
+    }
 }
 
 fn argv(args: &[&str]) -> Vec<String> {
@@ -394,6 +565,14 @@ fn write_generated(path: &Path, content: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_and_legacy_moon_versions_are_supported() {
+        assert!(supported_moon("moon 2.4.6"));
+        assert!(supported_moon("moon 2.5.4"));
+        assert!(!supported_moon("moon 2.4.5"));
+        assert!(!supported_moon("moon 3.0.0"));
+    }
 
     #[test]
     fn task_ids_follow_moon_rules() {

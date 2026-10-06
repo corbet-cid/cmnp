@@ -146,10 +146,8 @@ pub(super) fn execute(request: &Request) -> Result<()> {
         deadline.saturating_duration_since(Instant::now()),
     )?;
     let moon_version = probe.run(&argv(&["moon", "--version"]), true)?;
-    if !moon_version.starts_with("moon 2.5.") {
-        return Err(failure(
-            "Shared cache layout currently requires validated moon 2.5.x",
-        ));
+    if !supported_moon(&moon_version) {
+        return Err(failure("Shared cache layout requires moon 2.4.6 or 2.5.x"));
     }
     share_artifacts(&root, &shared)?;
     let mut probes = BTreeMap::new();
