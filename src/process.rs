@@ -62,6 +62,18 @@ impl Runner {
         }
     }
 
+    /// Machine output (notably NUL-delimited paths) must not be trimmed.
+    #[cfg(unix)]
+    pub fn run_raw(&self, argv: &[String]) -> Result<String> {
+        validate_command(argv)?;
+        Ok(String::from_utf8(self.run_unix_bytes(argv, true)?)?)
+    }
+
+    #[cfg(not(unix))]
+    pub fn run_raw(&self, _argv: &[String]) -> Result<String> {
+        Err(failure("Moon execution requires the verified Unix backend"))
+    }
+
     #[cfg(unix)]
     fn run_unix_bytes(&self, argv: &[String], capture: bool) -> Result<Vec<u8>> {
         let started = Instant::now();

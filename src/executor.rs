@@ -23,6 +23,9 @@ const RESULTS: &str = ".ccid/results";
 /// Every tool check locks the repository's target cache, so tasks run one at a time.
 const MUTEX: &str = "ccid-target";
 
+#[path = "shared_cache.rs"]
+mod shared_cache;
+
 /// Check declaration as owned by the caller's manifest. Field-for-field
 /// compatible with ccid's manifest check: the tool identity hashes the whole
 /// declaration, so this struct must serialize exactly like the caller's.
@@ -52,6 +55,10 @@ pub struct Check {
     pub cache_env: Vec<String>,
     pub cache_commit: bool,
     pub cache_inputs: Option<Vec<String>>,
+    pub cache: Option<bool>,
+    /// Explicit promise that commands/Nix do not observe moving external state
+    /// or Git provenance. Required before sharing these open-ended checks.
+    pub cache_pure: bool,
 }
 
 /// Validated execution request. The caller owns manifest parsing, check
@@ -102,83 +109,7 @@ pub fn execute(request: &Request) -> Result<()> {
     if request.plan {
         return Ok(());
     }
-    let root = request.repo.canonicalize()?;
-    let runner = Runner::new(
-        root.clone(),
-        request.environment.clone(),
-        Duration::from_secs(120),
-    )?;
-    let moon_version = runner.run(&argv(&["moon", "--version"]), true)?;
-    let mut identities = BTreeMap::new();
-    let mut probes = BTreeMap::new();
-    for name in &request.selected {
-        let identity = tool_identity(
-            &runner,
-            &request.checks[name],
-            &request.environment,
-            &request.tool,
-            &request.tool_revision,
-            &mut probes,
-        )?;
-        identities.insert(name.clone(), identity);
-    }
-    event(json!({"event":"cached-identity","moon":moon_version,"identities":identities}));
-
-    write_generated(
-        &root.join(".moon/workspace.yml"),
-        &render_workspace(&request.project),
-    )?;
-    write_generated(
-        &root.join("moon.yml"),
-        &render_tasks(
-            &request.checks,
-            &request.selected,
-            &request.manifest_arg,
-            &request.tool,
-            &identities,
-        ),
-    )?;
-    // Results are task outputs: a cache hit restores them, a miss writes them fresh.
-    let results = root.join(RESULTS);
-    if results.exists() {
-        fs::remove_dir_all(&results)?;
-    }
-
-    let mut moon_environment = request.environment.clone();
-    // Transport configuration must not change task hashes between schedulers.
-    // moon supports configuring its cache endpoint without rewriting workspace files.
-    if let Some(url) = remote_cache(&moon_environment)? {
-        moon_environment.insert("MOON_REMOTE_HOST".into(), url.clone().into());
-        moon_environment.insert(
-            "MOON_REMOTE_API".into(),
-            if url.starts_with("http") {
-                "http"
-            } else {
-                "grpc"
-            }
-            .into(),
-        );
-        moon_environment.insert("MOON_REMOTE_CACHE_COMPRESSION".into(), "zstd".into());
-    }
-    let mut command = argv(&["moon", "run"]);
-    command.extend(
-        request
-            .selected
-            .iter()
-            .map(|name| format!("{}:{name}", request.project)),
-    );
-    if request.force {
-        command.push("--force".into());
-    }
-    let timeout = value(&moon_environment, "CI_TIMEOUT")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2700);
-    let started = Instant::now();
-    Runner::new(root, moon_environment, Duration::from_secs(timeout))?.run(&command, false)?;
-    event(
-        json!({"event":"cached-finish","checks":request.selected,"seconds":started.elapsed().as_secs_f64()}),
-    );
-    Ok(())
+    shared_cache::execute(request)
 }
 
 fn argv(args: &[&str]) -> Vec<String> {
@@ -254,6 +185,19 @@ fn javascript_executable(manager: &str, windows: bool) -> &str {
 /// Validate repository-relative file globs. Environment and commit inputs have
 /// dedicated fields so they cannot accidentally bypass the commit opt-in.
 fn validate_cache_inputs(check: &Check) -> Result<()> {
+    if check.cache_env.iter().any(|key| {
+        ["CI_COMMIT_", "CI_JOB_", "CI_PIPELINE_", "CI_RUN_", "MOON_"]
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+            || ["RUNNER_TEMP", "TMPDIR", "TEMP", "TMP"].contains(&key.as_str())
+    }) {
+        return Err(failure(
+            "Run metadata and temporary paths cannot be cache environment inputs",
+        ));
+    }
+    if check.kind == "javascript" && check.install == Some(false) {
+        return Err(failure("Cached JavaScript requires a locked install; ambient node_modules is not an input contract"));
+    }
     if check.cache_env.iter().any(|key| key == "CI_COMMIT_SHA") && !check.cache_commit {
         return Err(failure("CI_COMMIT_SHA requires cache_commit = true; remove it from cache_env for content-only checks"));
     }
@@ -283,11 +227,11 @@ fn tool_identity(
     check: &Check,
     environment: &Environment,
     tool: &str,
-    tool_revision: &str,
+    _tool_revision: &str,
     probe_results: &mut BTreeMap<Vec<String>, String>,
 ) -> Result<String> {
+    let mut tools = BTreeMap::from([("executor".to_owned(), tool.to_owned())]);
     let mut parts = vec![
-        format!("{tool} {tool_revision}"),
         format!(
             "platform {} {}",
             std::env::consts::OS,
@@ -300,16 +244,13 @@ fn tool_identity(
         // Bind the entire declaration even when narrow globs exclude the manifest.
         serde_json::to_string(check)?,
     ];
-    for key in &check.cache_env {
-        if key != "CI_COMMIT_SHA" {
-            parts.push(format!("env {key} {:?}", value(environment, key)));
-        }
-    }
+    parts.push(serde_json::to_string(
+        &crate::inputs::semantic_environment(check, environment),
+    )?);
     if check.cache_commit {
-        let commit = value(environment, "CI_COMMIT_SHA")
-            .filter(|commit| commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
-            .ok_or_else(|| failure("cache_commit requires an exact CI_COMMIT_SHA"))?;
-        parts.push(format!("commit {commit}"));
+        return Err(failure(
+            "Commit-sensitive checks cannot share content results",
+        ));
     }
     let mut probes = check.cache_tools.clone();
     match check.kind.as_str() {
@@ -345,7 +286,45 @@ fn tool_identity(
             serde_json::to_string(&probe)?,
             probe_results[&probe]
         ));
+        tools.insert(format!("probe:{}", probe[0]), probe[0].clone());
     }
+    if check.kind == "cargo" {
+        let sysroot = match check.toolchain.as_deref().unwrap_or("system") {
+            "system" => runner.run(&argv(&["rustc", "--print", "sysroot"]), true)?,
+            toolchain => runner.run(
+                &argv(&["rustup", "run", toolchain, "rustc", "--print", "sysroot"]),
+                true,
+            )?,
+        };
+        let sysroot = Path::new(&sysroot).canonicalize()?;
+        if !sysroot.starts_with("/nix/store") {
+            return Err(failure("Cached Cargo currently requires an immutable Nix compiler sysroot; use an uncached check for mutable toolchains"));
+        }
+        tools.insert(
+            "compiler-runtime".into(),
+            sysroot.join("bin/rustc").to_string_lossy().into_owned(),
+        );
+        if check.test_runner.as_deref() == Some("nextest") {
+            tools.insert("test-runner".into(), "cargo-nextest".into());
+        }
+        for (role, variable) in [("c-compiler", "CC"), ("cxx-compiler", "CXX")] {
+            if let Some(name) = value(environment, variable) {
+                tools.insert(role.into(), name);
+            }
+        }
+        if value(environment, "CI_LINKER").as_deref() == Some("mold") {
+            tools.insert("linker".into(), "mold".into());
+        }
+        for name in ["cc", "cargo-clippy", "rustfmt"] {
+            if crate::inputs::executable(name, environment).is_ok() {
+                tools.insert(name.into(), name.into());
+            }
+        }
+        if let Some(wrapper) = value(environment, "RUSTC_WRAPPER").filter(|s| !s.is_empty()) {
+            tools.insert("wrapper".into(), wrapper);
+        }
+    }
+    parts.push(crate::inputs::tool_set_digest(&tools, runner)?);
     Ok(format!("{:x}", Sha256::digest(parts.join("\n").as_bytes())))
 }
 
@@ -375,29 +354,14 @@ fn render_tasks(
         let receipt = format!("{RESULTS}/{name}.jsonl");
         let mut outputs = checks[name].cache_outputs.clone();
         outputs.push(receipt.clone());
-        let mut inputs = checks[name]
-            .cache_inputs
-            .clone()
-            .unwrap_or_else(|| argv(&["**/*"]));
-        inputs.extend(argv(&[
-            "!.git/**",
-            "!.moon/**",
-            "!moon.yml",
-            "!.ccid/**",
-            "!target/**",
-            "$CCID_TOOL_IDENTITY",
-        ]));
-        for check in checks.values() {
-            for output in &check.cache_outputs {
-                inputs.push(format!("!{output}"));
-                inputs.push(format!("!{output}/**"));
-            }
-        }
+        // The central snapshot already binds files, locks, flags, tools and
+        // semantic environment. Native hashing must not reintroduce job paths.
+        let inputs = argv(&["$CCID_TOOL_IDENTITY"]);
         tasks.insert(
             name.clone(),
             json!({
                 "command": [tool, "check", "--repo", ".", "--manifest", manifest, "--check", name],
-                "env": { "CCID_RECEIPT": receipt, "CCID_TOOL_IDENTITY": identities[name] },
+                "env": { "CCID_RECEIPT": receipt, "CCID_TOOL_IDENTITY": identities[name], "CCID_CACHE_CHILD": "1" },
                 "inputs": inputs,
                 "outputs": outputs,
                 "options": { "runFromWorkspaceRoot": true, "mutex": MUTEX }
@@ -504,10 +468,7 @@ mod tests {
             task["outputs"],
             json!(["binary", ".ccid/results/test.jsonl"])
         );
-        assert!(task["inputs"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("!binary")));
+        assert_eq!(task["inputs"], json!(["$CCID_TOOL_IDENTITY"]));
         assert_eq!(task["options"]["mutex"], MUTEX);
         assert!(task["inputs"]
             .as_array()
@@ -527,7 +488,7 @@ mod tests {
             &runner,
             check,
             environment,
-            "ccid",
+            std::env::current_exe().unwrap().to_str().unwrap(),
             "revision",
             &mut BTreeMap::new(),
         )
@@ -561,9 +522,7 @@ mod tests {
         let mut environment = Environment::new();
         environment.insert("CI_COMMIT_SHA".into(), "a".repeat(40).into());
         let original = identity(&content, &environment);
-        let stamped = identity(&stamp, &environment);
         environment.insert("CI_COMMIT_SHA".into(), "b".repeat(40).into());
-        assert_ne!(identity(&stamp, &environment), stamped);
         assert_eq!(identity(&content, &environment), original);
         let directory = tempfile::tempdir().unwrap();
         let runner = Runner::new(
@@ -576,7 +535,7 @@ mod tests {
             &runner,
             &stamp,
             &Environment::new(),
-            "ccid",
+            std::env::current_exe().unwrap().to_str().unwrap(),
             "revision",
             &mut BTreeMap::new()
         )
@@ -585,7 +544,11 @@ mod tests {
 
     #[test]
     fn tool_versions_linker_and_check_definition_remain_inputs() {
-        let probe = argv(&["example-tool", "--version"]);
+        let tool = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let probe = argv(&[&tool, "--version"]);
         let mut check = Check {
             cache_tools: vec![probe.clone()],
             ..Check::default()
@@ -603,7 +566,7 @@ mod tests {
             &runner,
             &check,
             &environment,
-            "ccid",
+            &tool,
             "revision",
             &mut probes,
         )
@@ -614,7 +577,7 @@ mod tests {
                 &runner,
                 &check,
                 &environment,
-                "ccid",
+                &tool,
                 "revision",
                 &mut probes
             )
@@ -628,7 +591,7 @@ mod tests {
                 &runner,
                 &check,
                 &environment,
-                "ccid",
+                &tool,
                 "revision",
                 &mut probes
             )
@@ -642,7 +605,7 @@ mod tests {
                 &runner,
                 &check,
                 &environment,
-                "ccid",
+                &tool,
                 "revision",
                 &mut probes
             )
@@ -668,19 +631,7 @@ mod tests {
         let tasks: serde_json::Value =
             serde_json::from_str(text.split_once('\n').unwrap().1).unwrap();
         let inputs = tasks["tasks"]["test"]["inputs"].as_array().unwrap();
-        for required in [
-            "src/**",
-            "Cargo.*",
-            "!src/generated/**",
-            "!.git/**",
-            "!.moon/**",
-            "!.ccid/**",
-            "!target/**",
-            "$CCID_TOOL_IDENTITY",
-        ] {
-            assert!(inputs.contains(&json!(required)));
-        }
-        assert!(!inputs.contains(&json!("**/*")));
+        assert_eq!(inputs, &vec![json!("$CCID_TOOL_IDENTITY")]);
         assert_eq!(
             tasks["tasks"]["test"]["env"]["CCID_TOOL_IDENTITY"],
             "identity"
