@@ -485,6 +485,7 @@ pub fn execution_environment(check: &Check, env: &Environment) -> Environment {
         "BUN_RUNTIME_TRANSPILER_CACHE_PATH",
         "DENO_DIR",
         "NODE_COMPILE_CACHE",
+        "TSC_CACHE_DIR",
         "PLAYWRIGHT_BROWSERS_PATH",
         "PUPPETEER_CACHE_DIR",
         "TYPST_PACKAGE_CACHE_PATH",

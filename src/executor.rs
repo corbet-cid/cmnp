@@ -26,6 +26,11 @@ const MUTEX: &str = "ccid-target";
 #[path = "shared_cache.rs"]
 mod shared_cache;
 
+struct CachePreflight {
+    identity: String,
+    moon_version: String,
+}
+
 /// Check declaration as owned by the caller's manifest. Field-for-field
 /// compatible with ccid's manifest check: the tool identity hashes the whole
 /// declaration, so this struct must serialize exactly like the caller's.
@@ -133,7 +138,8 @@ pub fn execute(request: &Request) -> Result<()> {
             "CI_TIMEOUT".into(),
             remaining.as_secs().max(1).to_string().into(),
         );
-        let reason = cache_bypass_reason(&one);
+        let mut prepared = None;
+        let reason = cache_bypass_reason(&one, &mut prepared);
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(failure("Check deadline exceeded"));
@@ -146,7 +152,6 @@ pub fn execute(request: &Request) -> Result<()> {
             event(
                 json!({"event":"cache-bypass","check":name,"reason":reason,"execution":"uncached"}),
             );
-            bypassed.push(json!({"check":name,"reason":reason}));
             // Preserve the ordinary check environment and product exit status.
             // Never retry here after a cache transaction has begun executing.
             let mut env = one.environment.clone();
@@ -174,21 +179,52 @@ pub fn execute(request: &Request) -> Result<()> {
                 ),
             )?;
             env.insert("CCID_RECEIPT".into(), receipt.into_os_string());
-            Runner::new(one.repo.clone(), env, remaining)?.run(
-                &[
-                    one.tool.clone(),
-                    "check".into(),
-                    "--repo".into(),
-                    ".".into(),
-                    "--manifest".into(),
-                    one.manifest_arg.clone(),
-                    "--check".into(),
-                    name.clone(),
-                ],
-                false,
-            )?;
+            let mut command = vec![
+                one.tool.clone(),
+                "check".into(),
+                "--repo".into(),
+                ".".into(),
+                "--manifest".into(),
+                one.manifest_arg.clone(),
+                "--check".into(),
+                name.clone(),
+            ];
+            // Timing is optional instrumentation, never a check prerequisite.
+            let timer = value(&env, "CMNP_TIME")
+                .filter(|path| Path::new(path).is_file())
+                .and_then(|time| {
+                    tempfile::NamedTempFile::new_in(one.repo.join(".ccid"))
+                        .ok()
+                        .map(|file| (time, file))
+                });
+            if let Some((time, file)) = &timer {
+                let mut measured = vec![
+                    time.clone(),
+                    "-q".into(),
+                    "-f".into(),
+                    "{\"user\":%U,\"system\":%S}".into(),
+                    "-o".into(),
+                    file.path().to_string_lossy().into_owned(),
+                    "--".into(),
+                ];
+                measured.extend(command);
+                command = measured;
+            }
+            let outcome = Runner::new(one.repo.clone(), env, remaining)?.run(&command, false);
+            let cpu: Option<serde_json::Value> = timer.and_then(|(_, file)| {
+                fs::read(file.path())
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            });
+            let measurement = json!({"event":"cache-bypass-complete","check":name,"reason":reason,"cpu_seconds":cpu,"success":outcome.is_ok()});
+            event(measurement.clone());
+            bypassed.push(measurement);
+            outcome?;
         } else {
-            shared_cache::execute(&one)?;
+            shared_cache::execute(
+                &one,
+                prepared.ok_or_else(|| failure("Missing cache preflight"))?,
+            )?;
             let metrics: serde_json::Value =
                 serde_json::from_slice(&fs::read(one.repo.join(".ccid/cache-metrics.json"))?)?;
             measurements.extend(
@@ -220,7 +256,7 @@ fn supported_moon(version: &str) -> bool {
 
 /// Cache availability is a preflight decision, never a reason to skip product
 /// checks or to replay an already-started computation after an error.
-fn cache_bypass_reason(request: &Request) -> Option<String> {
+fn cache_bypass_reason(request: &Request, prepared: &mut Option<CachePreflight>) -> Option<String> {
     if request.force {
         return Some("uncached execution explicitly requested".into());
     }
@@ -242,6 +278,9 @@ fn cache_bypass_reason(request: &Request) -> Option<String> {
     };
     if let Err(error) = crate::content_key::validate_root(Path::new(&root)) {
         return Some(format!("result-cache storage unavailable: {error}"));
+    }
+    if let Err(error) = tempfile::NamedTempFile::new_in(&root) {
+        return Some(format!("result-cache storage is not writable: {error}"));
     }
     let runner = match Runner::new(
         request.repo.clone(),
@@ -266,7 +305,7 @@ fn cache_bypass_reason(request: &Request) -> Option<String> {
     if let Err(error) = crate::inputs::lock_digest(&request.repo, check) {
         return Some(format!("dependency lock is not cacheable: {error}"));
     }
-    if let Err(error) = tool_identity(
+    let identity = match tool_identity(
         &runner,
         check,
         &request.environment,
@@ -274,10 +313,17 @@ fn cache_bypass_reason(request: &Request) -> Option<String> {
         &request.tool_revision,
         &mut BTreeMap::new(),
     ) {
-        return Some(format!("tool identity is not cacheable: {error}"));
-    }
+        Ok(identity) => identity,
+        Err(error) => return Some(format!("tool identity is not cacheable: {error}")),
+    };
     match runner.run(&argv(&["moon", "--version"]), true) {
-        Ok(version) if supported_moon(&version) => None,
+        Ok(version) if supported_moon(&version) => {
+            *prepared = Some(CachePreflight {
+                identity,
+                moon_version: version,
+            });
+            None
+        }
         Ok(version) => Some(format!("unsupported result-cache runtime: {version}")),
         Err(_) => Some("moon is unavailable; running ordinary checks".into()),
     }

@@ -121,7 +121,7 @@ fn parse_report(report: &serde_json::Value, target: &str) -> Result<(String, Str
     Ok((status.into(), hash.into()))
 }
 
-pub(super) fn execute(request: &Request) -> Result<()> {
+pub(super) fn execute(request: &Request, prepared: CachePreflight) -> Result<()> {
     if request.force {
         return Err(failure(
             "Shared result caching cannot force recomputation; use an explicit uncached check",
@@ -145,8 +145,7 @@ pub(super) fn execute(request: &Request) -> Result<()> {
         request.environment.clone(),
         deadline.saturating_duration_since(Instant::now()),
     )?;
-    let moon_version = probe.run(&argv(&["moon", "--version"]), true)?;
-    if !supported_moon(&moon_version) {
+    if !supported_moon(&prepared.moon_version) {
         return Err(failure("Shared cache layout requires moon 2.4.6 or 2.5.x"));
     }
     share_artifacts(&root, &shared)?;
@@ -181,14 +180,7 @@ pub(super) fn execute(request: &Request) -> Result<()> {
             return Err(failure("Nix cache requires a committed clean flake"));
         }
         let source = inputs::source_digest(&root, check, &request.environment)?;
-        let identity = tool_identity(
-            &probe,
-            check,
-            &request.environment,
-            &request.tool,
-            &request.tool_revision,
-            &mut probes,
-        )?;
+        let identity = prepared.identity.clone();
         let receipt = format!("{RESULTS}/{name}.jsonl");
         let mut outputs = check.cache_outputs.clone();
         outputs.push(receipt.clone());
