@@ -13,6 +13,23 @@ run where. Checks are defined once, there and in that policy, never in cmnp.
 
 cdgr is the dormant sibling adapter built on Dagger.
 
+## Crate
+
+`cmnp` is a Rust library (this repo). `ccid cached` calls
+`cmnp::executor::execute` with its validated check declarations; ccid owns the
+manifest and check definitions, cmnp owns how moon runs them:
+
+- `executor::Check` — check declaration, field-for-field compatible with ccid's
+  manifest check (the tool identity hashes the whole declaration).
+- `executor::Request` — validated run: repository, moon project, checks,
+  selection, tool name/revision and environment.
+- `executor::execute` — probe tool identities, generate `.moon/workspace.yml`
+  and `moon.yml`, run moon, return results and receipts.
+- `executor::validate_selection`, `project_id`, `remote_cache` — shared by
+  ccid's `cached` command so validation lives in exactly one place.
+
+There is no `cmnp` binary: repositories keep calling `ccid cached`.
+
 ## Layout
 
 | Path | Content |
