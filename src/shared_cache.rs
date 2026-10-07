@@ -296,11 +296,15 @@ pub(super) fn execute(request: &Request, prepared: CachePreflight) -> Result<()>
         } else {
             None
         };
-        // A process error leaves Running until explicit child-tree reconciliation.
+        // The runner reaped the check's process group on exit or terminated it
+        // on deadline and interruption, so a failed run is a final Failed
+        // attempt: never reused, and the next identical request computes again.
+        // Only a hard kill of this process leaves a Running record behind.
         if let Err(error) = run {
             event(
                 json!({"event":"cache-check","check":name,"key":key,"status":"failed","cpu_seconds":cpu,"wait_seconds":waited,"duplicate_computations":null}),
             );
+            let _ = guard.publish_failure(None);
             return Err(error);
         }
         let (status, moon_hash) = report(&root, &format!("{}:{name}", request.project))?;
@@ -312,9 +316,17 @@ pub(super) fn execute(request: &Request, prepared: CachePreflight) -> Result<()>
             ));
         }
         if inputs::source_digest(&root, check, &request.environment)? != source {
-            return Err(failure(
-                "Check mutated its declared source inputs; result not published",
-            ));
+            // Publication is optional: the check itself passed, so its result
+            // stands, but a run that rewrote its own declared inputs is never
+            // reusable. Record a Failed attempt and carry on without the cache.
+            event(
+                json!({"event":"cache-publication-skipped","check":name,"key":key,"reason":"check mutated its declared source inputs"}),
+            );
+            let _ = guard.publish_failure(None);
+            let record = json!({"event":"cache-check","check":name,"key":key,"native_hash":moon_hash,"status":status,"computed":computed,"duplicate_computations":duplicates,"wait_seconds":waited,"cpu_seconds":cpu,"published":false});
+            event(record.clone());
+            measurements.push(record);
+            continue;
         }
         let output = output_digest(&root, &outputs)?;
         if let Some(expected) = &prior {

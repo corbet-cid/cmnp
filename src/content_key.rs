@@ -498,6 +498,24 @@ impl Guard {
 /// Unresolved Running records (possible crash: old children may still hold the
 /// target) refuse new work until reconciliation; corrupt, oversized, symlinked,
 /// nonregular, or key-mismatched records fail closed the same way.
+/// The result ledger declines to serve a key (unresolved Running record,
+/// corrupt or untrusted state). No compute has started, so callers degrade to
+/// ordinary uncached execution instead of failing the job.
+#[derive(Debug)]
+pub struct LedgerRefusal(String);
+
+impl std::fmt::Display for LedgerRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LedgerRefusal {}
+
+fn refusal(error: impl std::fmt::Display) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(LedgerRefusal(error.to_string()))
+}
+
 pub fn acquire(root: &Path, key: &str, timeout: Duration) -> Result<Guard> {
     if INTERRUPTED.load(Ordering::SeqCst) {
         return Err(failure("Single-flight acquisition interrupted"));
@@ -511,15 +529,16 @@ pub fn acquire(root: &Path, key: &str, timeout: Duration) -> Result<Guard> {
     validate_key_hex(key)?;
     let root = validate_root(root)?;
     let (lock_path, state_path) = key_paths(&root, key)?;
-    reject_untrusted_file(&lock_path, "Result lock")?;
+    reject_untrusted_file(&lock_path, "Result lock").map_err(refusal)?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&lock_path)?;
-    if !lock.metadata()?.is_file() {
-        return Err(failure("Result lock must be a regular file"));
+        .open(&lock_path)
+        .map_err(refusal)?;
+    if !lock.metadata().map_err(refusal)?.is_file() {
+        return Err(refusal("Result lock must be a regular file"));
     }
     loop {
         if INTERRUPTED.load(Ordering::SeqCst) || Instant::now() >= deadline {
@@ -543,7 +562,7 @@ pub fn acquire(root: &Path, key: &str, timeout: Duration) -> Result<Guard> {
             Err(TryLockError::Error(error)) => return Err(error.into()),
         }
     }
-    let observed = read_state(&state_path, key)?;
+    let observed = read_state(&state_path, key).map_err(refusal)?;
     if INTERRUPTED.load(Ordering::SeqCst) || Instant::now() >= deadline {
         return Err(failure(
             "Single-flight acquisition interrupted or deadline exceeded",
@@ -551,7 +570,7 @@ pub fn acquire(root: &Path, key: &str, timeout: Duration) -> Result<Guard> {
     }
     if let Some(state) = &observed {
         if matches!(state.status, Status::Running) {
-            return Err(failure(
+            return Err(refusal(
                 "Unresolved running record; refuse new compute until reconciliation proves old children are gone",
             ));
         }
@@ -579,6 +598,32 @@ mod tests {
         owner.start_deadline = Instant::now();
         assert!(owner.begin_compute().is_err());
         assert!(!dir.path().join(format!("{key}.json")).exists());
+    }
+
+    #[test]
+    fn unresolved_running_record_is_a_typed_ledger_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = fixture().key_hex().unwrap();
+        {
+            let mut owner = acquire(dir.path(), &key, Duration::from_secs(5)).unwrap();
+            owner.begin_compute().unwrap();
+            // Dropped without publishing, as after a hard kill of the owner.
+        }
+        let error = acquire(dir.path(), &key, Duration::from_secs(5))
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<LedgerRefusal>().is_some());
+    }
+
+    #[test]
+    fn published_failure_permits_a_fresh_attempt_of_the_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = fixture().key_hex().unwrap();
+        let mut first = acquire(dir.path(), &key, Duration::from_secs(5)).unwrap();
+        first.begin_compute().unwrap();
+        first.publish_failure(None).unwrap();
+        let mut second = acquire(dir.path(), &key, Duration::from_secs(5)).unwrap();
+        assert_eq!(second.begin_compute().unwrap().attempts, 2);
     }
 
     fn digest(byte: u8) -> String {

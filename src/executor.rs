@@ -148,6 +148,38 @@ pub fn execute(request: &Request) -> Result<()> {
             "CI_TIMEOUT".into(),
             remaining.as_secs().max(1).to_string().into(),
         );
+        let mut reason = reason;
+        if reason.is_none() {
+            let preflight = prepared
+                .take()
+                .ok_or_else(|| failure("Missing cache preflight"))?;
+            match shared_cache::execute(&one, preflight) {
+                Ok(()) => {
+                    let metrics: serde_json::Value = serde_json::from_slice(&fs::read(
+                        one.repo.join(".ccid/cache-metrics.json"),
+                    )?)?;
+                    measurements.extend(
+                        metrics["checks"]
+                            .as_array()
+                            .ok_or_else(|| failure("Missing cache measurements"))?
+                            .iter()
+                            .cloned(),
+                    );
+                    continue;
+                }
+                // The ledger refused before any compute started: degrade to an
+                // ordinary uncached check instead of failing the job.
+                Err(error) => {
+                    if error
+                        .downcast_ref::<crate::content_key::LedgerRefusal>()
+                        .is_none()
+                    {
+                        return Err(error);
+                    }
+                    reason = Some(format!("result ledger unavailable for this key: {error}"));
+                }
+            }
+        }
         if let Some(reason) = reason {
             event(
                 json!({"event":"cache-bypass","check":name,"reason":reason,"execution":"uncached"}),
@@ -220,20 +252,6 @@ pub fn execute(request: &Request) -> Result<()> {
             event(measurement.clone());
             bypassed.push(measurement);
             outcome?;
-        } else {
-            shared_cache::execute(
-                &one,
-                prepared.ok_or_else(|| failure("Missing cache preflight"))?,
-            )?;
-            let metrics: serde_json::Value =
-                serde_json::from_slice(&fs::read(one.repo.join(".ccid/cache-metrics.json"))?)?;
-            measurements.extend(
-                metrics["checks"]
-                    .as_array()
-                    .ok_or_else(|| failure("Missing cache measurements"))?
-                    .iter()
-                    .cloned(),
-            );
         }
     }
     let hits = measurements.iter().filter(|r| r["computed"] == 0).count();
