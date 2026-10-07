@@ -384,7 +384,101 @@ pub fn lock_digest(root: &Path, check: &Check) -> Result<String> {
     Err(failure("Result caching requires a dependency lockfile"))
 }
 
+/// Identity of the directories a command check finds programs in.
+///
+/// Nix store entries are content addressed, so their store path names them
+/// exactly. Entries inside the repository are covered by the source digest.
+/// Any other directory is mutable: it contributes a digest of its listing
+/// (name, kind, size, modification time, link target), so an upgraded tool
+/// changes the key. Absent entries cannot supply tools and are skipped. The
+/// location of a mutable directory is deliberately not part of the identity.
+pub fn path_identity(root: &Path, env: &Environment) -> Result<String> {
+    let path = env
+        .get(std::ffi::OsStr::new("PATH"))
+        .ok_or_else(|| failure("Missing tool PATH"))?;
+    let root = root.canonicalize().ok();
+    let mut parts = Vec::new();
+    for entry in std::env::split_paths(path) {
+        let Ok(resolved) = entry.canonicalize() else {
+            continue;
+        };
+        if root.as_ref().is_some_and(|r| resolved.starts_with(r)) {
+            continue;
+        }
+        if let Ok(relative) = resolved.strip_prefix("/nix/store") {
+            if let Some(part) = relative.components().next() {
+                parts.push(format!("store:{}", part.as_os_str().to_string_lossy()));
+                continue;
+            }
+        }
+        parts.push(format!("listing:{}", directory_listing_digest(&resolved)?));
+    }
+    Ok(format!("{:x}", Sha256::digest(parts.join("\n").as_bytes())))
+}
+
+fn directory_listing_digest(directory: &Path) -> Result<String> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let meta = fs::symlink_metadata(entry.path())?;
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        let detail = if meta.is_symlink() {
+            format!("link {}", fs::read_link(entry.path())?.display())
+        } else {
+            format!("file {} {modified}", meta.len())
+        };
+        entries.push(format!("{} {detail}", entry.file_name().to_string_lossy()));
+    }
+    entries.sort();
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(entries.join("\n").as_bytes())
+    ))
+}
+
+/// Digest of the cargo configuration the runner supplies through
+/// `CARGO_HOME` (`config.toml` or `config`): target linkers, rustflags,
+/// source replacement. Absent files are distinct from empty ones.
+pub fn cargo_home_config(env: &Environment) -> Result<String> {
+    let Some(home) = env.get(std::ffi::OsStr::new("CARGO_HOME")) else {
+        return Ok("no-cargo-home".into());
+    };
+    let mut parts = Vec::new();
+    for name in ["config.toml", "config"] {
+        let path = Path::new(home).join(name);
+        parts.push(if path.is_file() {
+            format!("{name}:{}", file_digest(&path)?)
+        } else {
+            format!("{name}:absent")
+        });
+    }
+    Ok(parts.join(" "))
+}
+
 pub const SEMANTIC_ENV: &[&str] = &[
+    // Build environment supplied by the runner's toolchain wrapper (values are
+    // content-addressed store paths): where headers, libraries and tools are.
+    "PKG_CONFIG_PATH",
+    "PKG_CONFIG_SYSROOT_DIR",
+    "LD_LIBRARY_PATH",
+    "LIBRARY_PATH",
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "NIX_CFLAGS_COMPILE",
+    "NIX_CFLAGS_LINK",
+    "NIX_LDFLAGS",
+    "OPENSSL_DIR",
+    "OPENSSL_LIB_DIR",
+    "OPENSSL_INCLUDE_DIR",
+    "PYTHONPATH",
+    "NODE_PATH",
+    "CHROME_BIN",
+    "CHROMEDRIVER",
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
     "RUSTDOCFLAGS",
@@ -423,11 +517,145 @@ pub const SEMANTIC_ENV: &[&str] = &[
     "LC_ALL",
 ];
 
+/// Runner plumbing forwarded to cacheable work without entering the key.
+const PLUMBING: &[&str] = &[
+    "PATH",
+    "HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "CARGO_TARGET_DIR",
+    "CI_CACHE_ROOT",
+    "CI_REPOSITORY_URL",
+    "CI_JOBS",
+    "CI_MEMORY_MB",
+    "CI_MEMORY_PER_JOB_MB",
+    "CI_MIN_AVAILABLE_MB",
+    "CI_TIMEOUT",
+    "CI_NIX_JOBS",
+    "CI_NIX_CORES",
+    "TMPDIR",
+    "RUNNER_TEMP",
+    "RUSTC_WRAPPER",
+    "SCCACHE_DIR",
+    "SCCACHE_CACHE_SIZE",
+    // Native caches validate their own entries. Their location must reach
+    // checked commands without introducing machine paths into content keys.
+    "CCACHE_DIR",
+    "GOCACHE",
+    "GOMODCACHE",
+    "npm_config_cache",
+    "NPM_CONFIG_CACHE",
+    "npm_config_store_dir",
+    "pnpm_config_store_dir",
+    "PNPM_HOME",
+    "YARN_CACHE_FOLDER",
+    "UV_CACHE_DIR",
+    "UV_PYTHON_INSTALL_DIR",
+    "PIP_CACHE_DIR",
+    "BUN_INSTALL_CACHE_DIR",
+    "BUN_RUNTIME_TRANSPILER_CACHE_PATH",
+    "DENO_DIR",
+    "NODE_COMPILE_CACHE",
+    "TSC_CACHE_DIR",
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "PUPPETEER_CACHE_DIR",
+    "TYPST_PACKAGE_CACHE_PATH",
+    "WASM_PACK_CACHE",
+    "XDG_CACHE_HOME",
+    "NIX_CACHE_HOME",
+    "NIX_REMOTE",
+    "BUILDKIT_HOST",
+    "TF_PLUGIN_CACHE_DIR",
+    "SSL_CERT_FILE",
+    "NIX_SSL_CERT_FILE",
+    "NIX_LD",
+    "NIX_LD_LIBRARY_PATH",
+    "PROTO_HOME",
+    "MOON_HOME",
+    "CCID_REMOTE_CACHE",
+    "CMNP_TIME",
+];
+
+/// Name prefixes and exact names of inherited variables that vary per run, name
+/// a job or a location, or reach the network: never forwarded to cacheable work.
+const AMBIENT_EXCLUDED_PREFIXES: &[&str] = &[
+    "CI_",
+    "CCID_",
+    "CROW_",
+    "CFRG_",
+    "SOURCE_",
+    "CARGO_TARGET_",
+    "GIT_",
+    "SSH_",
+    "GPG_",
+    "DBUS_",
+    "MOON_",
+    "XDG_RUNTIME_",
+    "BASH_FUNC_",
+];
+const AMBIENT_EXCLUDED_NAMES: &[&str] = &[
+    "PWD",
+    "OLDPWD",
+    "SHLVL",
+    "_",
+    "HOSTNAME",
+    "TERM",
+    "COLORTERM",
+    "LINES",
+    "COLUMNS",
+    "LS_COLORS",
+    "MAIL",
+    "TEMP",
+    "TMP",
+    "USER",
+    "LOGNAME",
+];
+const CREDENTIAL_FRAGMENTS: &[&str] = &[
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "NETRC",
+    "CREDENTIAL",
+    "AUTH",
+    "PRIVATE_KEY",
+    "API_KEY",
+];
+
+/// Inherited variables a custom `commands` check keeps seeing as it would
+/// uncached: everything the runner provides except per-run state, credentials
+/// and plumbing. They are forwarded AND keyed, so a different toolchain
+/// environment can never replay another environment's result. Typed kinds
+/// (cargo, javascript, nix) keep their declared environment contract.
+pub fn ambient_names(check: &Check, env: &Environment) -> Vec<String> {
+    if check.kind != "commands" {
+        return vec![];
+    }
+    env.keys()
+        .filter_map(|key| key.to_str())
+        .filter(|name| {
+            !name.is_empty()
+                && !PLUMBING.contains(name)
+                && !SEMANTIC_ENV.contains(name)
+                && !name.starts_with("CARGO_PROFILE_")
+                && !AMBIENT_EXCLUDED_NAMES.contains(name)
+                && !AMBIENT_EXCLUDED_PREFIXES
+                    .iter()
+                    .any(|p| name.starts_with(p))
+                && !CREDENTIAL_FRAGMENTS
+                    .iter()
+                    .any(|f| name.to_ascii_uppercase().contains(f))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 pub fn semantic_environment(check: &Check, env: &Environment) -> BTreeMap<String, Option<String>> {
     SEMANTIC_ENV
         .iter()
         .map(|s| (*s).to_owned())
         .chain(check.cache_env.iter().cloned())
+        .chain(ambient_names(check, env))
         .chain(
             env.keys()
                 .filter_map(|s| s.to_str())
@@ -447,70 +675,18 @@ pub fn semantic_environment(check: &Check, env: &Environment) -> BTreeMap<String
 /// are not handed to cacheable work. Check-specific semantic env is hashed.
 pub fn execution_environment(check: &Check, env: &Environment) -> Environment {
     let mut result = Environment::new();
-    let plumbing = [
-        "PATH",
-        "HOME",
-        "CARGO_HOME",
-        "RUSTUP_HOME",
-        "CARGO_TARGET_DIR",
-        "CI_CACHE_ROOT",
-        "CI_REPOSITORY_URL",
-        "CI_JOBS",
-        "CI_MEMORY_MB",
-        "CI_MEMORY_PER_JOB_MB",
-        "CI_MIN_AVAILABLE_MB",
-        "CI_TIMEOUT",
-        "CI_NIX_JOBS",
-        "CI_NIX_CORES",
-        "TMPDIR",
-        "RUNNER_TEMP",
-        "RUSTC_WRAPPER",
-        "SCCACHE_DIR",
-        "SCCACHE_CACHE_SIZE",
-        // Native caches validate their own entries. Their location must reach
-        // checked commands without introducing machine paths into content keys.
-        "CCACHE_DIR",
-        "GOCACHE",
-        "GOMODCACHE",
-        "npm_config_cache",
-        "NPM_CONFIG_CACHE",
-        "npm_config_store_dir",
-        "pnpm_config_store_dir",
-        "PNPM_HOME",
-        "YARN_CACHE_FOLDER",
-        "UV_CACHE_DIR",
-        "UV_PYTHON_INSTALL_DIR",
-        "PIP_CACHE_DIR",
-        "BUN_INSTALL_CACHE_DIR",
-        "BUN_RUNTIME_TRANSPILER_CACHE_PATH",
-        "DENO_DIR",
-        "NODE_COMPILE_CACHE",
-        "TSC_CACHE_DIR",
-        "PLAYWRIGHT_BROWSERS_PATH",
-        "PUPPETEER_CACHE_DIR",
-        "TYPST_PACKAGE_CACHE_PATH",
-        "WASM_PACK_CACHE",
-        "XDG_CACHE_HOME",
-        "NIX_CACHE_HOME",
-        "NIX_REMOTE",
-        "BUILDKIT_HOST",
-        "TF_PLUGIN_CACHE_DIR",
-        "SSL_CERT_FILE",
-        "NIX_SSL_CERT_FILE",
-        "NIX_LD",
-        "NIX_LD_LIBRARY_PATH",
-        "PROTO_HOME",
-        "MOON_HOME",
-        "CCID_REMOTE_CACHE",
-        "CMNP_TIME",
-    ];
-    for key in plumbing
+    for key in PLUMBING
         .iter()
         .copied()
         .chain(SEMANTIC_ENV.iter().copied())
         .chain(check.cache_env.iter().map(String::as_str))
     {
         if let Some(v) = env.get(std::ffi::OsStr::new(key)) {
+            result.insert(key.into(), v.clone());
+        }
+    }
+    for key in ambient_names(check, env) {
+        if let Some(v) = env.get(std::ffi::OsStr::new(&key)) {
             result.insert(key.into(), v.clone());
         }
     }
@@ -686,5 +862,140 @@ mod tests {
             value(&execution_environment(&check, &native), "GOFLAGS").as_deref(),
             Some("-race")
         );
+    }
+
+    fn path_env(entries: &[&Path]) -> Environment {
+        let mut env = Environment::new();
+        env.insert("PATH".into(), std::env::join_paths(entries).unwrap());
+        env
+    }
+
+    #[test]
+    fn path_identity_follows_tool_content_not_location() {
+        let repo = tempfile::tempdir().unwrap();
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let stamp = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for dir in [&a, &b] {
+            let file = dir.path().join("tool");
+            fs::write(&file, "one").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+        }
+        let first = path_identity(repo.path(), &path_env(&[a.path()])).unwrap();
+        assert_eq!(
+            first,
+            path_identity(repo.path(), &path_env(&[b.path()])).unwrap()
+        );
+        // A changed, added or replaced tool changes the identity.
+        fs::write(a.path().join("tool"), "longer").unwrap();
+        assert_ne!(
+            first,
+            path_identity(repo.path(), &path_env(&[a.path()])).unwrap()
+        );
+        fs::write(b.path().join("extra"), "x").unwrap();
+        assert_ne!(
+            first,
+            path_identity(repo.path(), &path_env(&[b.path()])).unwrap()
+        );
+        // Order matters (it decides which program wins); absent entries do not.
+        let missing = repo.path().join("absent-directory");
+        assert_eq!(
+            path_identity(repo.path(), &path_env(&[a.path(), b.path()])).unwrap(),
+            path_identity(repo.path(), &path_env(&[a.path(), &missing, b.path()])).unwrap()
+        );
+        assert_ne!(
+            path_identity(repo.path(), &path_env(&[a.path(), b.path()])).unwrap(),
+            path_identity(repo.path(), &path_env(&[b.path(), a.path()])).unwrap()
+        );
+        // Directories inside the repository are covered by the source digest.
+        let inside = repo.path().join("bin");
+        fs::create_dir(&inside).unwrap();
+        assert_eq!(
+            path_identity(repo.path(), &path_env(&[a.path()])).unwrap(),
+            path_identity(repo.path(), &path_env(&[a.path(), &inside])).unwrap()
+        );
+        assert!(path_identity(repo.path(), &Environment::new()).is_err());
+    }
+
+    #[test]
+    fn cargo_home_configuration_is_part_of_the_toolchain_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let mut env = Environment::new();
+        assert_eq!(cargo_home_config(&env).unwrap(), "no-cargo-home");
+        env.insert("CARGO_HOME".into(), home.path().as_os_str().to_owned());
+        let absent = cargo_home_config(&env).unwrap();
+        fs::write(home.path().join("config.toml"), "").unwrap();
+        let empty = cargo_home_config(&env).unwrap();
+        fs::write(home.path().join("config.toml"), "[build]\njobs = 1\n").unwrap();
+        let set = cargo_home_config(&env).unwrap();
+        fs::write(home.path().join("config"), "legacy").unwrap();
+        let legacy = cargo_home_config(&env).unwrap();
+        let all = [absent, empty, set, legacy];
+        for (i, one) in all.iter().enumerate() {
+            for other in &all[i + 1..] {
+                assert_ne!(one, other);
+            }
+        }
+    }
+
+    #[test]
+    fn commands_keep_their_toolchain_environment_keyed_and_forwarded() {
+        let commands = Check {
+            kind: "commands".into(),
+            ..Check::default()
+        };
+        let mut env = Environment::new();
+        for (name, value) in [
+            ("FONTCONFIG_FILE", "/store/fonts.conf"),
+            ("CHROME_BIN", "/store/chrome"),
+            ("SOME_TOOL_HOME", "/store/tool"),
+            ("CI_PIPELINE_NUMBER", "7"),
+            ("CCID_JOB_REQUEST", "{}"),
+            ("CROW_AGENT", "a"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GITHUB_TOKEN", "secret"),
+            ("FORGE_PASSWORD", "secret"),
+            ("NETRC", "/home/x/.netrc"),
+            ("PWD", "/tmp/job"),
+            ("SOURCE_ARCHIVE", "/a.tar"),
+            ("HOME", "/home/runner"),
+        ] {
+            env.insert(name.into(), value.into());
+        }
+        let forwarded = execution_environment(&commands, &env);
+        for name in ["FONTCONFIG_FILE", "CHROME_BIN", "SOME_TOOL_HOME"] {
+            assert!(forwarded.contains_key(std::ffi::OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "CI_PIPELINE_NUMBER",
+            "CROW_AGENT",
+            "GIT_CONFIG_COUNT",
+            "GITHUB_TOKEN",
+            "FORGE_PASSWORD",
+            "NETRC",
+            "PWD",
+            "SOURCE_ARCHIVE",
+        ] {
+            assert!(
+                !forwarded.contains_key(std::ffi::OsStr::new(name)),
+                "{name} leaked"
+            );
+        }
+        // Plumbing is forwarded but never keyed; ambient variables are keyed.
+        let keyed = semantic_environment(&commands, &env);
+        assert!(keyed.contains_key("SOME_TOOL_HOME") && keyed.contains_key("FONTCONFIG_FILE"));
+        assert!(!keyed.contains_key("HOME") && !keyed.contains_key("CI_PIPELINE_NUMBER"));
+        // Typed kinds keep the declared contract only.
+        let cargo = Check {
+            kind: "cargo".into(),
+            ..Check::default()
+        };
+        assert!(!execution_environment(&cargo, &env)
+            .contains_key(std::ffi::OsStr::new("SOME_TOOL_HOME")));
+        assert!(!semantic_environment(&cargo, &env).contains_key("SOME_TOOL_HOME"));
     }
 }

@@ -124,6 +124,45 @@ fn parse_report(report: &serde_json::Value, target: &str) -> Result<(String, Str
     Ok((status.into(), hash.into()))
 }
 
+/// Every input of one check's result key, assembled in one place so that its
+/// completeness is testable: source tree, dependency lock, effective command,
+/// tool identity (toolchain, runner configuration, executables), moon, platform,
+/// semantic environment and the check declaration. Nothing here names a path,
+/// URL, commit or run.
+pub(super) fn key_inputs(
+    request: &Request,
+    check: &Check,
+    name: &str,
+    root: &Path,
+    source: String,
+    identity: String,
+    moon: String,
+) -> Result<content_key::ContentKeyInputs> {
+    let mut outputs = check.cache_outputs.clone();
+    outputs.push(format!("{RESULTS}/{name}.jsonl"));
+    Ok(content_key::ContentKeyInputs {
+        schema: content_key::SCHEMA,
+        kind: check.kind.clone(),
+        input_digest: source,
+        lock_digest: inputs::lock_digest(root, check)?,
+        commands: vec![vec![
+            request.tool.clone(),
+            "check".into(),
+            "--repo".into(),
+            ".".into(),
+            "--manifest".into(),
+            request.manifest_arg.clone(),
+            "--check".into(),
+            name.to_owned(),
+        ]],
+        tool_digests: BTreeMap::from([("executor".into(), identity), ("moon".into(), moon)]),
+        platform_abi: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        env: inputs::semantic_environment(check, &request.environment),
+        check_config: serde_json::to_value(check)?,
+        outputs,
+    })
+}
+
 pub(super) fn execute(request: &Request, prepared: CachePreflight) -> Result<()> {
     if request.force {
         return Err(failure(
@@ -159,17 +198,10 @@ pub(super) fn execute(request: &Request, prepared: CachePreflight) -> Result<()>
         if check.cache == Some(false) || check.cache_commit {
             return Err(failure("Check is explicitly non-cacheable"));
         }
-        if matches!(check.kind.as_str(), "commands" | "nix") && !check.cache_pure {
-            return Err(failure(
-                "Commands and Nix shared results require an explicit cache_pure contract",
-            ));
-        }
-        if check.kind == "commands"
-            && (check.cache_inputs.is_none() || check.cache_tools.is_empty())
-        {
-            return Err(failure(
-                "Commands caching requires explicit input and tool contracts",
-            ));
+        if let Some(reason) = check.uncached_reason(&root) {
+            return Err(failure(format!(
+                "Check cannot use shared results: {reason}"
+            )));
         }
         if check.kind == "nix"
             && (!root.join(".git").exists()
@@ -183,37 +215,18 @@ pub(super) fn execute(request: &Request, prepared: CachePreflight) -> Result<()>
             return Err(failure("Nix cache requires a committed clean flake"));
         }
         let source = inputs::source_digest(&root, check, &request.environment)?;
-        let identity = prepared.identity.clone();
         let receipt = format!("{RESULTS}/{name}.jsonl");
         let mut outputs = check.cache_outputs.clone();
         outputs.push(receipt.clone());
-        let key = content_key::ContentKeyInputs {
-            schema: content_key::SCHEMA,
-            kind: check.kind.clone(),
-            input_digest: source.clone(),
-            lock_digest: inputs::lock_digest(&root, check)?,
-            commands: vec![vec![
-                request.tool.clone(),
-                "check".into(),
-                "--repo".into(),
-                ".".into(),
-                "--manifest".into(),
-                request.manifest_arg.clone(),
-                "--check".into(),
-                name.clone(),
-            ]],
-            tool_digests: BTreeMap::from([
-                ("executor".into(), identity),
-                (
-                    "moon".into(),
-                    inputs::tool_digest("moon", &probe, &mut probes)?,
-                ),
-            ]),
-            platform_abi: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-            env: inputs::semantic_environment(check, &request.environment),
-            check_config: serde_json::to_value(check)?,
-            outputs: outputs.clone(),
-        }
+        let key = key_inputs(
+            request,
+            check,
+            name,
+            &root,
+            source.clone(),
+            prepared.identity.clone(),
+            inputs::tool_digest("moon", &probe, &mut probes)?,
+        )?
         .key_hex()?;
         let waiting = Instant::now();
         let mut guard = content_key::acquire(
@@ -383,5 +396,279 @@ mod tests {
             report["actions"][0]["status"] = json!(status);
             assert_eq!(parse_report(&report, "p:test").unwrap().0, status);
         }
+    }
+
+    // ---- Key completeness: every input of a deterministic check changes the
+    // key, and nothing about location, provenance or the URL does. ----
+
+    fn tools_dir(version: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("mytool");
+        fs::write(&tool, format!("#!/bin/sh\necho {version}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        // Equal modification times keep identical tool directories identical.
+        let stamp = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        File::options()
+            .write(true)
+            .open(&tool)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        dir
+    }
+    fn source(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for (path, content) in files {
+            let path = root.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        root
+    }
+    fn base_check() -> Check {
+        Check {
+            kind: "commands".into(),
+            commands: vec![vec!["mytool".into(), "--run".into()]],
+            ..Check::default()
+        }
+    }
+    fn environment(tools: &Path) -> Environment {
+        let mut paths = vec![tools.to_path_buf()];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let mut env = Environment::new();
+        env.insert("PATH".into(), std::env::join_paths(paths).unwrap());
+        env
+    }
+    /// The complete result key of one check, exactly as `execute` assembles it.
+    fn key(root: &Path, check: &Check, env: &Environment) -> String {
+        let request = Request {
+            repo: root.into(),
+            project: "project".into(),
+            manifest_arg: ".ci/ccid.toml".into(),
+            checks: BTreeMap::from([("t".into(), check.clone())]),
+            selected: vec!["t".into()],
+            plan: false,
+            force: false,
+            tool: "ccid".into(),
+            tool_revision: "revision".into(),
+            environment: env.clone(),
+        };
+        let runner = Runner::new(root.into(), env.clone(), Duration::from_secs(20)).unwrap();
+        let executor = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let identity = tool_identity(
+            &runner,
+            check,
+            env,
+            &executor,
+            "revision",
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        let source = inputs::source_digest(root, check, env).unwrap();
+        key_inputs(&request, check, "t", root, source, identity, "a".repeat(64))
+            .unwrap()
+            .key_hex()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_default_commands_check_is_pure_and_keyable_without_declarations() {
+        let check = base_check();
+        assert!(check.is_pure() && check.cache_tools.is_empty() && check.cache_inputs.is_none());
+        let root = source(&[("src/main.txt", "one"), (".ci/ccid.toml", "schema = 1")]);
+        let tools = tools_dir("v1");
+        assert_eq!(
+            key(root.path(), &check, &environment(tools.path())).len(),
+            64
+        );
+    }
+
+    #[test]
+    fn every_input_of_a_deterministic_check_changes_the_key() {
+        let tools = tools_dir("v1");
+        let env = environment(tools.path());
+        let files = [
+            ("src/main.txt", "one"),
+            ("Cargo.lock", "# lock a"),
+            (".ci/ccid.toml", "schema = 1"),
+        ];
+        let root = source(&files);
+        let check = base_check();
+        let baseline = key(root.path(), &check, &env);
+        assert_eq!(
+            key(root.path(), &check, &env),
+            baseline,
+            "key must be stable"
+        );
+        let mut seen = std::collections::BTreeSet::from([baseline.clone()]);
+        let mut distinct = |label: &str, value: String| {
+            assert!(seen.insert(value), "{label} did not change the key");
+        };
+
+        // Source tree: edit, add an untracked file, delete.
+        let edited = source(&files);
+        fs::write(edited.path().join("src/main.txt"), "two").unwrap();
+        distinct("edited file", key(edited.path(), &check, &env));
+        let added = source(&files);
+        fs::write(added.path().join("src/new.txt"), "x").unwrap();
+        distinct("added file", key(added.path(), &check, &env));
+        let removed = source(&files);
+        fs::remove_file(removed.path().join("src/main.txt")).unwrap();
+        distinct("removed file", key(removed.path(), &check, &env));
+        // Dependency lock.
+        let locked = source(&files);
+        fs::write(locked.path().join("Cargo.lock"), "# lock b").unwrap();
+        distinct("lock", key(locked.path(), &check, &env));
+        // Check declaration: command line, features, packages, flags, toolchain.
+        for (label, change) in [
+            (
+                "command",
+                Box::new(|c: &mut Check| c.commands[0].push("--more".into()))
+                    as Box<dyn Fn(&mut Check)>,
+            ),
+            (
+                "features",
+                Box::new(|c: &mut Check| c.features = vec!["tls".into()]),
+            ),
+            (
+                "packages",
+                Box::new(|c: &mut Check| c.packages = vec!["core".into()]),
+            ),
+            (
+                "all_features",
+                Box::new(|c: &mut Check| c.all_features = true),
+            ),
+            ("release", Box::new(|c: &mut Check| c.release = true)),
+            (
+                "actions",
+                Box::new(|c: &mut Check| c.actions = Some(vec!["clippy".into()])),
+            ),
+            (
+                "toolchain",
+                Box::new(|c: &mut Check| c.toolchain = Some("nightly".into())),
+            ),
+            (
+                "inputs",
+                Box::new(|c: &mut Check| c.cache_inputs = Some(vec!["src/**".into()])),
+            ),
+        ] {
+            let mut changed = check.clone();
+            change(&mut changed);
+            distinct(label, key(root.path(), &changed, &env));
+        }
+        // Semantic environment: flags, target, linker, locale, declared extras.
+        for (name, value) in [
+            ("RUSTFLAGS", "-Dwarnings"),
+            ("CARGO_BUILD_TARGET", "aarch64-unknown-linux-gnu"),
+            ("CI_LINKER", "mold"),
+            ("CARGO_PROFILE_RELEASE_LTO", "fat"),
+            ("TZ", "UTC"),
+            ("CC", "clang"),
+            ("FONTCONFIG_FILE", "/ambient/fonts.conf"),
+        ] {
+            let mut changed = env.clone();
+            changed.insert(name.into(), value.into());
+            distinct(name, key(root.path(), &check, &changed));
+        }
+        let declared = Check {
+            cache_env: vec!["MY_FLAG".into()],
+            ..check.clone()
+        };
+        let mut flagged = env.clone();
+        flagged.insert("MY_FLAG".into(), "1".into());
+        let without = key(root.path(), &declared, &env);
+        distinct(
+            "declared env present",
+            key(root.path(), &declared, &flagged),
+        );
+        assert_ne!(
+            without, baseline,
+            "declaring an env input is part of the check identity"
+        );
+        // Toolchain: the tool a command names, another program on PATH, the
+        // runner's cargo configuration.
+        let upgraded = tools_dir("v2");
+        distinct(
+            "tool bytes",
+            key(root.path(), &check, &environment(upgraded.path())),
+        );
+        let extra = tools_dir("v1");
+        fs::write(extra.path().join("other"), "x").unwrap();
+        distinct(
+            "another tool on PATH",
+            key(root.path(), &check, &environment(extra.path())),
+        );
+        let home = tempfile::tempdir().unwrap();
+        let mut with_home = env.clone();
+        with_home.insert("CARGO_HOME".into(), home.path().as_os_str().to_owned());
+        distinct(
+            "cargo home absent config",
+            key(root.path(), &check, &with_home),
+        );
+        fs::write(home.path().join("config.toml"), "[build]\nrustflags = []\n").unwrap();
+        distinct("cargo home config", key(root.path(), &check, &with_home));
+        fs::write(
+            home.path().join("config.toml"),
+            "[build]\nrustflags = [\"-C\", \"x\"]\n",
+        )
+        .unwrap();
+        distinct(
+            "cargo home config edit",
+            key(root.path(), &check, &with_home),
+        );
+    }
+
+    #[test]
+    fn location_provenance_url_and_run_metadata_never_change_the_key() {
+        let files = [("src/main.txt", "one"), (".ci/ccid.toml", "schema = 1")];
+        let check = base_check();
+        let (first_tools, second_tools) = (tools_dir("v1"), tools_dir("v1"));
+        let (first, second) = (source(&files), source(&files));
+        assert_ne!(first.path(), second.path());
+        assert_ne!(first_tools.path(), second_tools.path());
+        let mut env = environment(first_tools.path());
+        let baseline = key(first.path(), &check, &env);
+        // A different checkout path and an equivalent tool directory elsewhere.
+        assert_eq!(
+            key(second.path(), &check, &environment(second_tools.path())),
+            baseline
+        );
+        for (name, value) in [
+            ("CI_COMMIT_SHA", "b".repeat(40)),
+            ("CI_COMMIT_BRANCH", "feature".into()),
+            (
+                "CI_REPOSITORY_URL",
+                "https://forge.example.invalid/a/b".into(),
+            ),
+            ("CI_PIPELINE_NUMBER", "77".into()),
+            ("CI_JOB_ID", "9".into()),
+            ("TMPDIR", "/tmp/another".into()),
+            ("HOME", "/home/another".into()),
+            ("CARGO_TARGET_DIR", "/tmp/targets".into()),
+            ("CCID_REMOTE_CACHE", "grpc://cache.invalid:9092".into()),
+        ] {
+            env.insert(name.into(), value.into());
+            assert_eq!(
+                key(first.path(), &check, &env),
+                baseline,
+                "{name} leaked into the key"
+            );
+        }
+        // A pure declaration is identical whether spelled out or defaulted.
+        let spelled = Check {
+            cache_pure: Some(true),
+            ..check.clone()
+        };
+        assert_eq!(key(first.path(), &spelled, &env), baseline);
+    }
+
+    #[test]
+    fn declarations_that_need_no_cache_are_not_part_of_the_key() {
+        let encoded = serde_json::to_value(base_check()).unwrap();
+        assert!(encoded.get("cache_pure").is_none());
     }
 }

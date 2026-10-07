@@ -119,7 +119,11 @@ impl Runner {
                 #[cfg(unix)]
                 {
                     let _ = child.0.signal(15);
-                    let grace = Instant::now() + Duration::from_secs(10);
+                    // The wrapped task is an executor with its own TERM to KILL
+                    // grace (10 s) for the process tree it owns. Waiting less
+                    // than that would kill it before its cleanup finishes and
+                    // orphan the task's descendants.
+                    let grace = Instant::now() + Duration::from_secs(20);
                     while Instant::now() < grace {
                         if child.0.try_wait()?.is_some() {
                             break;

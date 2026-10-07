@@ -30,7 +30,7 @@ steps:
   - name: repository-job
     image: bash
     environment:
-      CCID_REVISION: '77a5ac18542750de020ebf753d22c3200530282b'
+      CCID_REVISION: '223adb5a008f4ed1ba36d1f52796ccd29077db6e'
     commands:
       - |
         set -eu

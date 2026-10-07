@@ -61,9 +61,36 @@ pub struct Check {
     pub cache_commit: bool,
     pub cache_inputs: Option<Vec<String>>,
     pub cache: Option<bool>,
-    /// Explicit promise that commands/Nix do not observe moving external state
-    /// or Git provenance. Required before sharing these open-ended checks.
-    pub cache_pure: bool,
+    /// Deterministic checks (format, lint, build, test, docs) are pure by
+    /// default: their result is a function of the keyed inputs. `false` is the
+    /// explicit opt-out for a check that observes the network or the clock
+    /// (fetching integration scenarios, Tor, wall-clock assertions); it then
+    /// always runs uncached. It only decides *whether* a result is cached, so
+    /// it is not part of the key.
+    #[serde(skip_serializing)]
+    pub cache_pure: Option<bool>,
+}
+
+impl Check {
+    /// Declared purity: only the explicit opt-out makes a check impure.
+    pub fn is_pure(&self) -> bool {
+        self.cache_pure != Some(false)
+    }
+
+    /// Why this check must run uncached, if it must: the explicit opt-out, or
+    /// (unless `cache_pure = true` overrides) a recognised use of the network
+    /// or the clock. `None` means the check is cacheable by default.
+    pub fn uncached_reason(&self, root: &Path) -> Option<String> {
+        match self.cache_pure {
+            Some(true) => None,
+            Some(false) => Some(
+                "check declares cache_pure = false (observes the network or the clock)".into(),
+            ),
+            None => crate::purity::volatile_reason(self, root).map(|why| {
+                format!("{why}; it observes the network or the clock (declare cache_pure = true to override)")
+            }),
+        }
+    }
 }
 
 /// Validated execution request. The caller owns manifest parsing, check
@@ -84,6 +111,10 @@ pub struct Request {
     pub tool_revision: String,
     pub environment: Environment,
 }
+
+/// Printed when a check that was cached by default (no explicit purity
+/// declaration) fails: cached work sees only the keyed environment.
+const UNDECLARED_HINT: &str = "this check was cached by default and ran with only its declared environment (cache_env); if it reads other variables, declare them in cache_env, or set cache_pure = false (or cache = false) to run it uncached";
 
 /// Validate the selected checks before any execution: moon task names,
 /// repository-relative inputs, explicit outputs and tool probes.
@@ -174,6 +205,11 @@ pub fn execute(request: &Request) -> Result<()> {
                         .downcast_ref::<crate::content_key::LedgerRefusal>()
                         .is_none()
                     {
+                        if one.checks[name].cache_pure.is_none() {
+                            event(
+                                json!({"event":"cache-hint","check":name,"hint":UNDECLARED_HINT}),
+                            );
+                        }
                         return Err(error);
                     }
                     reason = Some(format!("result ledger unavailable for this key: {error}"));
@@ -282,11 +318,8 @@ fn cache_bypass_reason(request: &Request, prepared: &mut Option<CachePreflight>)
     if check.cache == Some(false) || check.cache_commit {
         return Some("check is explicitly not result-cacheable".into());
     }
-    if matches!(check.kind.as_str(), "commands" | "nix") && !check.cache_pure {
-        return Some("no explicit pure-result contract".into());
-    }
-    if check.kind == "commands" && (check.cache_inputs.is_none() || check.cache_tools.is_empty()) {
-        return Some("no complete input and tool contract".into());
+    if let Some(reason) = check.uncached_reason(&request.repo) {
+        return Some(reason);
     }
     if let Err(error) = validate_selection(&request.checks, &request.selected) {
         return Some(format!("result-cache contract is unavailable: {error}"));
@@ -455,6 +488,33 @@ fn validate_cache_inputs(check: &Check) -> Result<()> {
     Ok(())
 }
 
+/// Version probes every check of a kind needs regardless of its declaration.
+fn kind_probes(check: &Check) -> Vec<Vec<String>> {
+    match check.kind.as_str() {
+        "cargo" => match check.toolchain.as_deref().unwrap_or("system") {
+            "system" => vec![argv(&["rustc", "-vV"]), argv(&["cargo", "--version"])],
+            toolchain => vec![
+                argv(&["rustup", "run", toolchain, "rustc", "-vV"]),
+                argv(&["rustup", "run", toolchain, "cargo", "--version"]),
+            ],
+        },
+        "javascript" => {
+            let manager = check.manager.as_deref().unwrap_or("npm");
+            let mut probes = vec![];
+            if manager != "deno" {
+                probes.push(argv(&["node", "--version"]));
+            }
+            probes.push(vec![
+                javascript_executable(manager, cfg!(windows)).to_owned(),
+                "--version".into(),
+            ]);
+            probes
+        }
+        "nix" => vec![argv(&["nix", "--version"])],
+        _ => vec![],
+    }
+}
+
 /// Identity is per check: selecting a commit-sensitive build must not invalidate
 /// a content-only test. Probe each distinct tool only once across the selection.
 fn tool_identity(
@@ -482,35 +542,33 @@ fn tool_identity(
     parts.push(serde_json::to_string(
         &crate::inputs::semantic_environment(check, environment),
     )?);
+    // Runner-level toolchain configuration reaches every cargo-driven check.
+    if matches!(check.kind.as_str(), "cargo" | "commands") {
+        parts.push(format!(
+            "cargo-home-config: {}",
+            crate::inputs::cargo_home_config(environment)?
+        ));
+    }
     if check.cache_commit {
         return Err(failure(
             "Commit-sensitive checks cannot share content results",
         ));
     }
     let mut probes = check.cache_tools.clone();
-    match check.kind.as_str() {
-        "cargo" => match check.toolchain.as_deref().unwrap_or("system") {
-            "system" => {
-                probes.push(argv(&["rustc", "-vV"]));
-                probes.push(argv(&["cargo", "--version"]));
+    probes.extend(kind_probes(check));
+    if check.kind == "commands" && check.cache_tools.is_empty() {
+        // A custom command check that declares no tool probes is keyed by the
+        // executables it names and by the toolchain directories it resolves
+        // programs through: scripts run whatever they find on PATH.
+        for command in &check.commands {
+            if let Some(program) = command.first() {
+                tools.insert(format!("command:{program}"), program.clone());
             }
-            toolchain => {
-                probes.push(argv(&["rustup", "run", toolchain, "rustc", "-vV"]));
-                probes.push(argv(&["rustup", "run", toolchain, "cargo", "--version"]));
-            }
-        },
-        "javascript" => {
-            let manager = check.manager.as_deref().unwrap_or("npm");
-            if manager != "deno" {
-                probes.push(argv(&["node", "--version"]));
-            }
-            probes.push(vec![
-                javascript_executable(manager, cfg!(windows)).to_owned(),
-                "--version".into(),
-            ]);
         }
-        "nix" => probes.push(argv(&["nix", "--version"])),
-        _ => {}
+        parts.push(format!(
+            "path: {}",
+            crate::inputs::path_identity(&runner.root, environment)?
+        ));
     }
     probes.sort();
     probes.dedup();
@@ -912,5 +970,106 @@ mod tests {
         fs::write(&path, format!("{MARKER}\nold\n")).unwrap();
         assert!(write_generated(&path, &format!("{MARKER}\nnew\n")).is_ok());
         assert!(fs::read_to_string(&path).unwrap().ends_with("new\n"));
+    }
+
+    fn request(check: Check, environment: Environment, repo: &Path) -> Request {
+        Request {
+            repo: repo.into(),
+            project: "project".into(),
+            manifest_arg: ".ci/ccid.toml".into(),
+            checks: BTreeMap::from([("t".into(), check)]),
+            selected: vec!["t".into()],
+            plan: false,
+            force: false,
+            tool: "ccid".into(),
+            tool_revision: "revision".into(),
+            environment,
+        }
+    }
+
+    #[test]
+    fn deterministic_checks_are_pure_by_default_and_the_opt_out_is_explicit() {
+        for kind in ["cargo", "javascript", "commands", "nix"] {
+            let check: Check = toml::from_str(&format!("kind = '{kind}'")).unwrap();
+            assert!(check.is_pure(), "{kind} must be pure by default");
+        }
+        assert!(toml::from_str::<Check>("cache_pure = true")
+            .unwrap()
+            .is_pure());
+        assert!(!toml::from_str::<Check>("cache_pure = false")
+            .unwrap()
+            .is_pure());
+        let repo = tempfile::tempdir().unwrap();
+        // Without declarations a commands/nix check is no longer bypassed for
+        // purity: the first remaining reason is the missing storage.
+        for kind in ["commands", "nix"] {
+            let check: Check = toml::from_str(&format!("kind = '{kind}'")).unwrap();
+            let reason =
+                cache_bypass_reason(&request(check, Environment::new(), repo.path()), &mut None);
+            assert_eq!(
+                reason.as_deref(),
+                Some("CCID_RESULT_CACHE is not provisioned")
+            );
+        }
+        // The opt-outs always run uncached and say why.
+        let volatile: Check = toml::from_str("kind = 'commands'\ncache_pure = false").unwrap();
+        let reason = cache_bypass_reason(
+            &request(volatile, Environment::new(), repo.path()),
+            &mut None,
+        );
+        assert!(reason.unwrap().contains("cache_pure = false"));
+        let off: Check = toml::from_str("kind = 'commands'\ncache = false").unwrap();
+        let reason = cache_bypass_reason(&request(off, Environment::new(), repo.path()), &mut None);
+        assert_eq!(
+            reason.as_deref(),
+            Some("check is explicitly not result-cacheable")
+        );
+    }
+
+    #[test]
+    fn an_unidentifiable_toolchain_degrades_to_an_uncached_check() {
+        let repo = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(repo.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        let check: Check =
+            toml::from_str("kind = 'commands'\ncommands = [['no-such-program-anywhere']]").unwrap();
+        let mut environment = Environment::new();
+        environment.insert(
+            "CCID_RESULT_CACHE".into(),
+            storage.path().as_os_str().to_owned(),
+        );
+        environment.insert("PATH".into(), std::env::var_os("PATH").unwrap());
+        let reason =
+            cache_bypass_reason(&request(check, environment, repo.path()), &mut None).unwrap();
+        assert!(
+            reason.starts_with("tool identity is not cacheable"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn every_kind_binds_its_toolchain_versions() {
+        let probes = |toml: &str| kind_probes(&toml::from_str::<Check>(toml).unwrap());
+        assert_eq!(
+            probes("kind = 'cargo'"),
+            vec![argv(&["rustc", "-vV"]), argv(&["cargo", "--version"])]
+        );
+        assert_eq!(
+            probes("kind = 'cargo'\ntoolchain = 'nightly'"),
+            vec![
+                argv(&["rustup", "run", "nightly", "rustc", "-vV"]),
+                argv(&["rustup", "run", "nightly", "cargo", "--version"])
+            ]
+        );
+        assert_eq!(
+            probes("kind = 'javascript'\nmanager = 'pnpm'"),
+            vec![argv(&["node", "--version"]), argv(&["pnpm", "--version"])]
+        );
+        assert_eq!(
+            probes("kind = 'javascript'\nmanager = 'deno'"),
+            vec![argv(&["deno", "--version"])]
+        );
+        assert_eq!(probes("kind = 'nix'"), vec![argv(&["nix", "--version"])]);
+        assert!(probes("kind = 'commands'").is_empty());
     }
 }

@@ -39,6 +39,38 @@ There is no `cmnp` binary: repositories keep calling `ccid cached`.
 | `templates/rust/moon.yml` | Rust project tasks: test, clippy, build, with inputs and declared outputs |
 | `templates/.prototools` | Toolchain pins (proto) |
 
+## Which checks are cached
+
+Deterministic checks (format, lint, build, unit tests, docs) are pure by default:
+no `cache_pure` declaration, `cache_inputs` or `cache_tools` is needed. The result
+is stored under one content key made of the source tree (tracked and untracked
+files, default `**/*`), the dependency lock, the check declaration (command,
+features, packages, flags, toolchain), the semantic environment (compiler flags,
+target, linker, locale, `cache_env`), the platform, and the tool identity:
+executables and Nix runtime closures, the version probes of the check kind
+(`rustc -vV`, `cargo --version`, `node`, the package manager, `nix`), the cargo
+configuration the runner supplies through `CARGO_HOME`, and, for a `commands`
+check without `cache_tools`, the executables it names plus the directories on
+`PATH` (store paths for Nix, a listing digest for mutable directories). No path,
+URL, commit, branch or run number is part of the key.
+
+A check opts out explicitly with `cache_pure = false` (or `cache = false`) when its
+result depends on the network or the clock: advisory databases, fetching
+integration scenarios, Tor, wall-clock assertions. Obvious cases are recognised
+without a declaration and run uncached with the reason in the bypass receipt: a
+command or a first-level script that uses `ssh`, `cargo deny` or `cargo audit`,
+`npm audit`, `git fetch`/`clone`/`pull`/`push`/`ls-remote`, `nix flake update`,
+`date`, a downloader (`curl`, `wget`) without a checksum verification, reads run
+metadata (`CI_COMMIT_*`, `CI_JOB_*`, `CI_PIPELINE_*`, `CROW_*`, the repository URL),
+reads a credential variable, or reads commit provenance (`git log`, `git describe`,
+`git rev-parse HEAD`). `cache_pure = true` overrides that recognition. A custom `commands` check keeps seeing the runner's toolchain environment as it would
+uncached (everything inherited except per-run state, credentials and plumbing), and that
+environment is part of the key; typed kinds see only their declared environment. Cached work
+sees only its keyed environment; a default-cached check that fails prints a
+`cache-hint` event naming `cache_env` and the opt-outs. Whatever cannot be keyed (missing tool, unreadable lock, moon or
+storage unavailable, ledger refusal) degrades to an ordinary uncached run; it never
+fails the job.
+
 ## Status
 
 | Item | State |

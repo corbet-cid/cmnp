@@ -18,6 +18,7 @@ pub mod content_key;
 pub mod executor;
 pub mod inputs;
 mod process;
+mod purity;
 
 fn failure(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
     io::Error::other(message.into()).into()
