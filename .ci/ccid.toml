@@ -2,7 +2,7 @@ schema = 1
 project = "cmnp"
 
 [render]
-tool_revision = "b782a39f2ebb978f9c42143347a5af8212628921"
+tool_revision = "78a4e05b4e1cb25aaeba3966951564d74277bcbd"
 
 [checks.test]
 kind = "cargo"

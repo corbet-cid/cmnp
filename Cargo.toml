@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "LGPL-3.0-or-later"
 description = "Moon and proto execution behind ccid cached checks"
-repository = "https://git.corbet.ch/corbet-foss/cmnp.git"
+repository = "https://git.corbet.ch/corbet-cid/cmnp.git"
 
 [dependencies]
 process-wrap = { version = "10.0", default-features = false, features = ["std", "process-group"] }
