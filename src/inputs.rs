@@ -389,7 +389,7 @@ pub fn lock_digest(root: &Path, check: &Check) -> Result<String> {
 /// Nix store entries are content addressed, so their store path names them
 /// exactly. Entries inside the repository are covered by the source digest.
 /// Any other directory is mutable: it contributes a digest of its listing
-/// (name, kind, size, modification time, link target), so an upgraded tool
+/// (name, kind, size, link target), so an upgraded tool
 /// changes the key. Absent entries cannot supply tools and are skipped. The
 /// location of a mutable directory is deliberately not part of the identity.
 pub fn path_identity(root: &Path, env: &Environment) -> Result<String> {
@@ -421,15 +421,10 @@ fn directory_listing_digest(directory: &Path) -> Result<String> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let meta = fs::symlink_metadata(entry.path())?;
-        let modified = meta
-            .modified()
-            .ok()
-            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
         let detail = if meta.is_symlink() {
             format!("link {}", fs::read_link(entry.path())?.display())
         } else {
-            format!("file {} {modified}", meta.len())
+            format!("file {}", meta.len())
         };
         entries.push(format!("{} {detail}", entry.file_name().to_string_lossy()));
     }
@@ -585,6 +580,13 @@ const AMBIENT_EXCLUDED_PREFIXES: &[&str] = &[
     "CFRG_",
     "SOURCE_",
     "CARGO_TARGET_",
+    "DRONE_",
+    "PULLREQUEST_",
+    "WOODPECKER_",
+    "GITHUB_",
+    "GITLAB_",
+    "KUBERNETES_",
+    "BUILDKIT_",
     "GIT_",
     "SSH_",
     "GPG_",
@@ -609,6 +611,10 @@ const AMBIENT_EXCLUDED_NAMES: &[&str] = &[
     "TMP",
     "USER",
     "LOGNAME",
+    "USERPROFILE",
+    "TEMPDIR",
+    "NIX_BUILD_TOP",
+    "NIX_LOG_FD",
 ];
 const CREDENTIAL_FRAGMENTS: &[&str] = &[
     "TOKEN",
@@ -627,11 +633,39 @@ const CREDENTIAL_FRAGMENTS: &[&str] = &[
 /// and plumbing. They are forwarded AND keyed, so a different toolchain
 /// environment can never replay another environment's result. Typed kinds
 /// (cargo, javascript, nix) keep their declared environment contract.
+/// Per-job directories the runner announces (scratch, working directory): any
+/// variable whose value lives under one is about this job, not the check.
+fn job_locations(env: &Environment) -> Vec<String> {
+    ["TMPDIR", "RUNNER_TEMP", "TEMP", "TMP", "PWD"]
+        .iter()
+        .filter_map(|name| env.get(std::ffi::OsStr::new(name)))
+        .filter_map(|value| value.to_str())
+        .filter(|value| Path::new(value).is_absolute() && value.matches('/').count() >= 2)
+        .map(str::to_owned)
+        .collect()
+}
+fn names_job_location(value: &str, locations: &[String]) -> bool {
+    value.contains("/ccid-job-") || locations.iter().any(|l| value.starts_with(l.as_str()))
+}
+
+/// Kubernetes-style service discovery variables (`<SERVICE>_SERVICE_HOST`,
+/// `<SERVICE>_PORT_1234_TCP_ADDR`, ...) describe the cluster, not the check.
+fn service_discovery(name: &str) -> bool {
+    name.ends_with("_SERVICE_HOST")
+        || name.contains("_SERVICE_PORT")
+        || name.contains("_TCP")
+        || name.contains("_UDP")
+        || (name.ends_with("_PORT") && name.len() > 5)
+}
+
 pub fn ambient_names(check: &Check, env: &Environment) -> Vec<String> {
     if check.kind != "commands" {
         return vec![];
     }
-    env.keys()
+    let locations = job_locations(env);
+    env.iter()
+        .filter(|(_, value)| !names_job_location(value.to_str().unwrap_or(""), &locations))
+        .map(|(key, _)| key)
         .filter_map(|key| key.to_str())
         .filter(|name| {
             !name.is_empty()
@@ -642,6 +676,7 @@ pub fn ambient_names(check: &Check, env: &Environment) -> Vec<String> {
                 && !AMBIENT_EXCLUDED_PREFIXES
                     .iter()
                     .any(|p| name.starts_with(p))
+                && !service_discovery(name)
                 && !CREDENTIAL_FRAGMENTS
                     .iter()
                     .any(|f| name.to_ascii_uppercase().contains(f))
@@ -901,6 +936,17 @@ mod tests {
             first,
             path_identity(repo.path(), &path_env(&[b.path()])).unwrap()
         );
+        // Touching a file without changing it is not an upgrade.
+        fs::File::options()
+            .write(true)
+            .open(b.path().join("tool"))
+            .unwrap()
+            .set_modified(stamp + Duration::from_secs(99))
+            .unwrap();
+        assert_eq!(
+            path_identity(repo.path(), &path_env(&[b.path()])).unwrap(),
+            path_identity(repo.path(), &path_env(&[b.path()])).unwrap()
+        );
         // Order matters (it decides which program wins); absent entries do not.
         let missing = repo.path().join("absent-directory");
         assert_eq!(
@@ -961,7 +1007,17 @@ mod tests {
             ("FORGE_PASSWORD", "secret"),
             ("NETRC", "/home/x/.netrc"),
             ("PWD", "/tmp/job"),
+            ("TEMPDIR", "/store/elsewhere"),
+            ("NIX_BUILD_TOP", "/store/elsewhere"),
+            ("UNDER_PWD", "/tmp/job/inner/file"),
+            ("SCRATCH_OF_JOB", "/tmp/ccid-job-AbC123/scratch"),
             ("SOURCE_ARCHIVE", "/a.tar"),
+            ("DRONE_BUILD_NUMBER", "7"),
+            ("PULLREQUEST_DRONE_PULL_REQUEST", "1"),
+            ("USERPROFILE", "/tmp/job-home"),
+            ("KUBERNETES_SERVICE_HOST", "10.0.0.1"),
+            ("BUILDKIT_PORT_1234_TCP_ADDR", "10.0.0.2"),
+            ("OTHER_SERVICE_PORT_GRPC", "9092"),
             ("HOME", "/home/runner"),
         ] {
             env.insert(name.into(), value.into());

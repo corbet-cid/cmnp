@@ -51,7 +51,7 @@ executables and Nix runtime closures, the version probes of the check kind
 (`rustc -vV`, `cargo --version`, `node`, the package manager, `nix`), the cargo
 configuration the runner supplies through `CARGO_HOME`, and, for a `commands`
 check without `cache_tools`, the executables it names plus the directories on
-`PATH` (store paths for Nix, a listing digest for mutable directories). No path,
+`PATH` (store paths for Nix, a listing digest of name, size and link target for mutable directories) and the reported versions of the common toolchains found on `PATH` (`rustc`, `cargo`, `node`, `npm`, `pnpm`, `bun`, `deno`, `python3`, `uv`, `go`, `git`, `nix`), which shims and proxies hide from a listing. Every cached run prints a `cache-key` event with the digest of each key component and a short digest per environment variable (never a value): when an unchanged check misses, compare two runs' events to see which input moved. No path,
 URL, commit, branch or run number is part of the key.
 
 A check opts out explicitly with `cache_pure = false` (or `cache = false`) when its

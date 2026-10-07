@@ -20,17 +20,19 @@ variables:
 steps:
   - name: native-status-pending
     image: bash
+    environment:
+      CCID_VERDICT_JOBS: 'verify'
     commands:
       - |
         set -eu
         if [ -n "${CCID_STATUS_CONFIG:-}" ]; then
-          printf '%s  %s\n' "$CCID_STATUS_BINARY_SHA256" "$CCID_STATUS_BINARY" | sha256sum --check --strict
-          "$CCID_STATUS_BINARY" --commit "$CI_COMMIT_SHA" --name "ccid/$(printf '%s' "$CCID_JOB_REQUEST" | jq -er .job)" --url "$CI_PIPELINE_URL" --started "$CI_PIPELINE_CREATED" --state pending
+          printf '%s  %s\n' "$CI_TOOL_BINARY_SHA256" "$CI_TOOL_BINARY" | sha256sum --check --strict
+          "$CI_TOOL_BINARY" verdict --commit "$CI_COMMIT_SHA" --job "$(printf '%s' "$CCID_JOB_REQUEST" | jq -er .job)" --gating "$CCID_VERDICT_JOBS" --url "$CI_PIPELINE_URL" --started "$CI_PIPELINE_CREATED" --state pending
         fi
   - name: repository-job
     image: bash
     environment:
-      CCID_REVISION: '223adb5a008f4ed1ba36d1f52796ccd29077db6e'
+      CCID_REVISION: 'b782a39f2ebb978f9c42143347a5af8212628921'
     commands:
       - |
         set -eu
@@ -44,12 +46,14 @@ steps:
     image: bash
     when:
       - status: [success, failure]
+    environment:
+      CCID_VERDICT_JOBS: 'verify'
     commands:
       - |
         set -eu
         if [ -n "${CCID_STATUS_CONFIG:-}" ]; then
-          printf '%s  %s\n' "$CCID_STATUS_BINARY_SHA256" "$CCID_STATUS_BINARY" | sha256sum --check --strict
+          printf '%s  %s\n' "$CI_TOOL_BINARY_SHA256" "$CI_TOOL_BINARY" | sha256sum --check --strict
           state=failure
           if [ "$CI_PIPELINE_STATUS" = success ]; then state=success; fi
-          "$CCID_STATUS_BINARY" --commit "$CI_COMMIT_SHA" --name "ccid/$(printf '%s' "$CCID_JOB_REQUEST" | jq -er .job)" --url "$CI_PIPELINE_URL" --started "$CI_PIPELINE_CREATED" --state "$state"
+          "$CI_TOOL_BINARY" verdict --commit "$CI_COMMIT_SHA" --job "$(printf '%s' "$CCID_JOB_REQUEST" | jq -er .job)" --gating "$CCID_VERDICT_JOBS" --url "$CI_PIPELINE_URL" --started "$CI_PIPELINE_CREATED" --state "$state"
         fi

@@ -163,6 +163,21 @@ pub(super) fn key_inputs(
     })
 }
 
+/// A receipt of what the key was made of: component digests and a short digest
+/// per environment variable (never a value). Comparing two runs' receipts shows
+/// which input moved when an unchanged check misses.
+fn key_parts(name: &str, key: &str, inputs: &content_key::ContentKeyInputs) -> serde_json::Value {
+    let short = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()))[..12].to_owned();
+    let env: BTreeMap<&String, Option<String>> = inputs
+        .env
+        .iter()
+        .map(|(k, v)| (k, v.as_deref().map(short)))
+        .collect();
+    json!({"event":"cache-key","check":name,"key":key,
+        "input_digest":inputs.input_digest,"lock_digest":inputs.lock_digest,
+        "tool_digests":inputs.tool_digests,"platform":inputs.platform_abi,"env":env})
+}
+
 pub(super) fn execute(request: &Request, prepared: CachePreflight) -> Result<()> {
     if request.force {
         return Err(failure(
@@ -218,7 +233,7 @@ pub(super) fn execute(request: &Request, prepared: CachePreflight) -> Result<()>
         let receipt = format!("{RESULTS}/{name}.jsonl");
         let mut outputs = check.cache_outputs.clone();
         outputs.push(receipt.clone());
-        let key = key_inputs(
+        let inputs = key_inputs(
             request,
             check,
             name,
@@ -226,8 +241,9 @@ pub(super) fn execute(request: &Request, prepared: CachePreflight) -> Result<()>
             source.clone(),
             prepared.identity.clone(),
             inputs::tool_digest("moon", &probe, &mut probes)?,
-        )?
-        .key_hex()?;
+        )?;
+        let key = inputs.key_hex()?;
+        event(key_parts(name, &key, &inputs));
         let waiting = Instant::now();
         let mut guard = content_key::acquire(
             &shared,
@@ -647,7 +663,7 @@ mod tests {
             ("CI_PIPELINE_NUMBER", "77".into()),
             ("CI_JOB_ID", "9".into()),
             ("TMPDIR", "/tmp/another".into()),
-            ("HOME", "/home/another".into()),
+            ("XDG_CACHE_HOME", "/home/another/.cache".into()),
             ("CARGO_TARGET_DIR", "/tmp/targets".into()),
             ("CCID_REMOTE_CACHE", "grpc://cache.invalid:9092".into()),
         ] {
@@ -670,5 +686,63 @@ mod tests {
     fn declarations_that_need_no_cache_are_not_part_of_the_key() {
         let encoded = serde_json::to_value(base_check()).unwrap();
         assert!(encoded.get("cache_pure").is_none());
+    }
+
+    #[test]
+    fn a_toolchain_upgrade_behind_an_unchanged_directory_changes_the_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let versioned = |reported: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let node = dir.path().join("node");
+            // Same name and size either way, like a shim in front of a toolchain.
+            fs::write(&node, format!("#!/bin/sh\necho {reported}\n")).unwrap();
+            fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        };
+        let (old, new) = (versioned("v20.1.0"), versioned("v22.2.0"));
+        let root = source(&[("src/main.txt", "one"), (".ci/ccid.toml", "schema = 1")]);
+        let check = Check {
+            commands: vec![vec!["sh".into(), "-c".into(), "true".into()]],
+            ..base_check()
+        };
+        assert_ne!(
+            key(root.path(), &check, &environment(old.path())),
+            key(root.path(), &check, &environment(new.path()))
+        );
+    }
+
+    #[test]
+    fn the_key_receipt_names_components_without_leaking_values() {
+        let tools = tools_dir("v1");
+        let mut env = environment(tools.path());
+        env.insert("FONTCONFIG_FILE".into(), "/very/secret/looking/path".into());
+        let root = source(&[("src/main.txt", "one"), (".ci/ccid.toml", "schema = 1")]);
+        let check = base_check();
+        let request = Request {
+            repo: root.path().into(),
+            project: "project".into(),
+            manifest_arg: ".ci/ccid.toml".into(),
+            checks: BTreeMap::from([("t".into(), check.clone())]),
+            selected: vec!["t".into()],
+            plan: false,
+            force: false,
+            tool: "ccid".into(),
+            tool_revision: "revision".into(),
+            environment: env,
+        };
+        let inputs = key_inputs(
+            &request,
+            &check,
+            "t",
+            root.path(),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+        )
+        .unwrap();
+        let receipt = key_parts("t", &inputs.key_hex().unwrap(), &inputs).to_string();
+        assert!(receipt.contains("FONTCONFIG_FILE"));
+        assert!(!receipt.contains("secret/looking"));
+        assert!(receipt.contains(&"b".repeat(64)) && receipt.contains("\"event\":\"cache-key\""));
     }
 }

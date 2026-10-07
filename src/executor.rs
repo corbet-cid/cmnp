@@ -488,6 +488,22 @@ fn validate_cache_inputs(check: &Check) -> Result<()> {
     Ok(())
 }
 
+/// Toolchains whose version a command check is keyed by when found on PATH.
+const DEFAULT_VERSION_PROBES: &[&[&str]] = &[
+    &["rustc", "-vV"],
+    &["cargo", "--version"],
+    &["node", "--version"],
+    &["npm", "--version"],
+    &["pnpm", "--version"],
+    &["bun", "--version"],
+    &["deno", "--version"],
+    &["python3", "--version"],
+    &["uv", "--version"],
+    &["go", "version"],
+    &["git", "--version"],
+    &["nix", "--version"],
+];
+
 /// Version probes every check of a kind needs regardless of its declaration.
 fn kind_probes(check: &Check) -> Vec<Vec<String>> {
     match check.kind.as_str() {
@@ -569,6 +585,26 @@ fn tool_identity(
             "path: {}",
             crate::inputs::path_identity(&runner.root, environment)?
         ));
+        // Version probes of the common toolchains found on PATH: shims and
+        // proxies hide upgrades from a directory listing, their reported
+        // versions do not. A probe that fails is part of the identity too, without its message (which may name paths).
+        for probe in DEFAULT_VERSION_PROBES {
+            if crate::inputs::executable(probe[0], environment).is_err() {
+                continue;
+            }
+            let probe = argv(probe);
+            let reported = match probe_results.get(&probe) {
+                Some(known) => known.clone(),
+                None => {
+                    let fresh = runner
+                        .run(&probe, true)
+                        .unwrap_or_else(|_| "probe failed".to_owned());
+                    probe_results.insert(probe.clone(), fresh.clone());
+                    fresh
+                }
+            };
+            parts.push(format!("{}: {reported}", serde_json::to_string(&probe)?));
+        }
     }
     probes.sort();
     probes.dedup();
