@@ -35,7 +35,10 @@ fn share_artifacts(root: &Path, shared: &Path) -> Result<()> {
         let target = root.join(".moon/cache").join(name);
         if fs::symlink_metadata(&target).is_ok() {
             if target.canonicalize()? != source.canonicalize()? {
-                return Err(failure("Moon artifact cache belongs to a different coordinator; use a fresh job workspace"));
+                // Nothing has started: the caller degrades to an uncached check.
+                return Err(crate::content_key::refusal(
+                    "Moon artifact cache belongs to a different coordinator",
+                ));
             }
         } else {
             #[cfg(unix)]
@@ -358,6 +361,20 @@ pub(super) fn execute(request: &Request, prepared: CachePreflight) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn foreign_moon_cache_is_a_typed_refusal_not_a_hard_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".moon/cache")).unwrap();
+        std::os::unix::fs::symlink(foreign.path(), root.path().join(".moon/cache/hashes")).unwrap();
+        let error = share_artifacts(root.path(), shared.path()).unwrap_err();
+        assert!(error
+            .downcast_ref::<crate::content_key::LedgerRefusal>()
+            .is_some());
+    }
+
     #[test]
     fn cached_action_with_passed_target_did_not_compute() {
         let hash = "a".repeat(64);

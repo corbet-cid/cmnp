@@ -512,7 +512,7 @@ impl std::fmt::Display for LedgerRefusal {
 
 impl std::error::Error for LedgerRefusal {}
 
-fn refusal(error: impl std::fmt::Display) -> Box<dyn std::error::Error + Send + Sync> {
+pub(crate) fn refusal(error: impl std::fmt::Display) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(LedgerRefusal(error.to_string()))
 }
 
