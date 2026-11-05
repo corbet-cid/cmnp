@@ -2,13 +2,15 @@ schema = 1
 project = "cmnp"
 
 [render]
-tool_revision = "78a4e05b4e1cb25aaeba3966951564d74277bcbd"
-
+tool_revision = "bd9aff07073185fb0a3503bab331aedefb6d8fd2"
+tool_sha256 = "38c0eadf2a2adb406f83c7d4892bc01a0a10b95671e1e671358e43a257bb5d23"
 [checks.test]
 kind = "cargo"
 
 [jobs.verify]
-scheduler = "crow"
+scheduler = "forgejo"
+runs_on = "heavy"
 checks = ["test"]
-workflow = "repository-jobs"
+workflow = "ci"
 command = ["bash", ".ci/run-job.sh"]
+events = ["manual"]
