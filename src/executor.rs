@@ -538,7 +538,7 @@ fn tool_identity(
     check: &Check,
     environment: &Environment,
     tool: &str,
-    _tool_revision: &str,
+    tool_revision: &str,
     probe_results: &mut BTreeMap<Vec<String>, String>,
 ) -> Result<String> {
     let mut tools = BTreeMap::from([("executor".to_owned(), tool.to_owned())]);
@@ -552,6 +552,9 @@ fn tool_identity(
             "linker {}",
             value(environment, "CI_LINKER").unwrap_or_else(|| "system".into())
         ),
+        // What a verdict MEANS: the caller's version of the check semantics (an epoch, not a build revision, so a
+        // release that changes no check semantics keeps every cached result).
+        format!("semantics {tool_revision}"),
         // Bind the entire declaration even when narrow globs exclude the manifest.
         serde_json::to_string(check)?,
     ];
@@ -938,6 +941,18 @@ mod tests {
             original
         );
         environment.clear();
+        // The caller's epoch (what a verdict means) is part of the identity; a build revision it does not pass is not.
+        let identity = |epoch: &str, probes: &mut BTreeMap<Vec<String>, String>| {
+            tool_identity(&runner, &check, &environment, &tool, epoch, probes).unwrap()
+        };
+        assert_eq!(
+            identity("epoch-1", &mut probes),
+            identity("epoch-1", &mut probes)
+        );
+        assert_ne!(
+            identity("epoch-1", &mut probes),
+            identity("epoch-2", &mut probes)
+        );
         check.commands = vec![argv(&["different-command"])];
         assert_ne!(
             tool_identity(
