@@ -531,6 +531,8 @@ const PLUMBING: &[&str] = &[
     "TMPDIR",
     "RUNNER_TEMP",
     "RUSTC_WRAPPER",
+    // Where the pinned tool releases are fetched from (a read-only package base, no credential): the channel test of ccid fetches each release from it.
+    "CCID_TOOL_URL",
     "SCCACHE_DIR",
     "SCCACHE_CACHE_SIZE",
     // Native caches validate their own entries. Their location must reach
