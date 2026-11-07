@@ -329,6 +329,16 @@ fn write_state(state_path: &Path, state: &AttemptState) -> Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer(&mut temp, state)?;
     temp.flush()?;
+    // A store shared by a group (a setgid directory writable by its group: the srv verdict store of the CI runner and the land gate) keeps its records readable and replaceable by
+    // that group; a private store keeps the temp file's 0600.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if std::fs::metadata(parent).is_ok_and(|meta| meta.mode() & 0o020 != 0) {
+            temp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o660))?;
+        }
+    }
     temp.as_file()
         .sync_all()
         .map_err(|e| failure(format!("Cannot sync attempt state: {e}")))?;
@@ -808,6 +818,28 @@ mod tests {
         let mut bad = fixture();
         bad.schema = 999;
         assert!(bad.key_hex().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_store_keeps_records_group_readable_and_a_private_one_stays_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |dir: u32| {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(dir)).unwrap();
+            let path = root.path().join("state.json");
+            let state = AttemptState {
+                schema: SCHEMA,
+                key: "k".into(),
+                attempts: 1,
+                status: Status::Running,
+                producer: None,
+            };
+            write_state(&path, &state).unwrap();
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(0o2775), 0o660);
+        assert_eq!(mode(0o700), 0o600);
     }
 
     #[test]
