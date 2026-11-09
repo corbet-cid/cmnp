@@ -571,6 +571,11 @@ const PLUMBING: &[&str] = &[
     "MOON_HOME",
     "CCID_REMOTE_CACHE",
     "CMNP_TIME",
+    // Where a check finds the release channel's fleet data, and the runner's extra spellings of the forge host. The
+    // caller keys the fleet data itself (its digest is declared environment, `cache_env`, of every check that reads it);
+    // a location or a host spelling names a machine, not the check, so both are forwarded and never keyed.
+    "CCID_FLEET_FILE",
+    "CCID_FORGE_HOSTS",
 ];
 
 /// Name prefixes and exact names of inherited variables that vary per run, name
@@ -1251,5 +1256,57 @@ mod tests {
             !keyed.keys().any(|name| name.starts_with("GIT_CONFIG_")),
             "git routing is plumbing, never a key input"
         );
+    }
+
+    #[test]
+    fn fleet_data_location_and_host_spellings_are_forwarded_and_never_keyed() {
+        for kind in ["commands", "cargo", "nix", "javascript"] {
+            let check = Check {
+                kind: kind.into(),
+                cache_env: vec!["CCID_FLEET_DIGEST".into()],
+                ..Check::default()
+            };
+            let env = Environment::from([
+                (
+                    "CCID_FLEET_FILE".into(),
+                    "/runner/cache/channel.json".into(),
+                ),
+                ("CCID_FORGE_HOSTS".into(), "forge.internal.example".into()),
+                ("CCID_FLEET_DIGEST".into(), "a".repeat(64).into()),
+            ]);
+            let forwarded = execution_environment(&check, &env);
+            for (name, expected) in [
+                ("CCID_FLEET_FILE", "/runner/cache/channel.json"),
+                ("CCID_FORGE_HOSTS", "forge.internal.example"),
+            ] {
+                assert_eq!(
+                    value(&forwarded, name).as_deref(),
+                    Some(expected),
+                    "{kind}: {name}"
+                );
+            }
+            let keyed = semantic_environment(&check, &env);
+            assert!(
+                !keyed.contains_key("CCID_FLEET_FILE"),
+                "{kind}: the location is never keyed"
+            );
+            assert!(
+                !keyed.contains_key("CCID_FORGE_HOSTS"),
+                "{kind}: a host spelling is never keyed"
+            );
+            assert_eq!(
+                keyed["CCID_FLEET_DIGEST"].as_deref(),
+                Some("a".repeat(64).as_str()),
+                "{kind}: the declared digest stays keyed"
+            );
+            // Another machine's location and spellings key the same; another digest does not.
+            let mut elsewhere = env.clone();
+            elsewhere.insert("CCID_FLEET_FILE".into(), "/lane/channel.json".into());
+            elsewhere.remove(std::ffi::OsStr::new("CCID_FORGE_HOSTS"));
+            assert_eq!(semantic_environment(&check, &elsewhere), keyed, "{kind}");
+            let mut other = env.clone();
+            other.insert("CCID_FLEET_DIGEST".into(), "b".repeat(64).into());
+            assert_ne!(semantic_environment(&check, &other), keyed, "{kind}");
+        }
     }
 }
