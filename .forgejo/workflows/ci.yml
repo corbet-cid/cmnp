@@ -7,12 +7,6 @@ on:
 concurrency:
   group: ccid-ci-${{ github.ref }}
   cancel-in-progress: true
-# The speed profile every CI compile shares: no incremental state, no debug information.
-env:
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
-  CARGO_PROFILE_RELEASE_DEBUG: "0"
-  CARGO_TERM_COLOR: never
 jobs:
   verify:
     runs-on: heavy
