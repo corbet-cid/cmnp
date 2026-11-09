@@ -145,6 +145,54 @@ fn find<'a>(tokens: impl Iterator<Item = &'a str>) -> Option<String> {
     None
 }
 
+/// Remove presence assertions (`${VAR:?message}`, `${VAR?message}`) for provenance
+/// variables. `: "${CI_COMMIT_SHA:?verify requires the exact source revision}"` only requires
+/// the variable to exist; it never reads the commit, so the result does not depend on it. Every
+/// other occurrence (`$CI_COMMIT_SHA`, `${CI_COMMIT_SHA}`, an argument) stays in the text and
+/// is still found by the scan.
+fn strip_presence_assertions(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'{') {
+            let start = index + 2;
+            let mut end = start;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_uppercase()
+                    || bytes[end].is_ascii_digit()
+                    || bytes[end] == b'_')
+            {
+                end += 1;
+            }
+            let name = &text[start..end];
+            let asserted = (bytes.get(end) == Some(&b':') && bytes.get(end + 1) == Some(&b'?'))
+                || bytes.get(end) == Some(&b'?');
+            if asserted && PROVENANCE_PREFIXES.iter().any(|p| name.starts_with(p)) {
+                let mut close = end;
+                let mut depth = 0usize;
+                while close < bytes.len() {
+                    match bytes[close] {
+                        b'{' => depth += 1,
+                        b'}' if depth == 0 => break,
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                    close += 1;
+                }
+                if close < bytes.len() {
+                    index = close + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = text[index..].chars().next().unwrap_or_default();
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
 fn script_text(root: &Path, argument: &str) -> Option<String> {
     let path = Path::new(argument);
     let known = ["sh", "bash", "py", "mjs", "js", "ts", "rb", "pl"];
@@ -184,6 +232,7 @@ pub fn volatile_reason(check: &Check, root: &Path) -> Option<String> {
                 .filter(|line| !line.trim_start().starts_with('#'))
                 .collect::<Vec<_>>()
                 .join("\n");
+            let code = strip_presence_assertions(&code);
             if let Some(found) = find(code.split(separators).filter(|t| !t.is_empty())) {
                 return Some(format!("script {argument} {found}"));
             }
@@ -279,15 +328,30 @@ mod tests {
             volatile_reason(&subject, root.path()).as_deref(),
             Some("script .ci/verify.sh uses cargo deny")
         );
+        // A presence assertion only requires the variable; it reads no value and changes no
+        // result. Any other occurrence is a value read and stays volatile.
         fs::write(
             &verify,
             "set -e\n: \"${CI_COMMIT_SHA:?verify requires the exact source revision}\"\ncargo test\n",
+        )
+        .unwrap();
+        assert_eq!(volatile_reason(&subject, root.path()), None);
+        fs::write(
+            &verify,
+            "set -e\n: \"${CI_COMMIT_SHA:?verify requires the exact source revision}\"\necho \"$CI_COMMIT_SHA\"\ncargo test\n",
         )
         .unwrap();
         assert_eq!(
             volatile_reason(&subject, root.path()).as_deref(),
             Some("script .ci/verify.sh reads run metadata CI_COMMIT_SHA")
         );
+        // An assertion for a variable that is not provenance is left to the ordinary scan.
+        fs::write(
+            &verify,
+            "set -e\n: \"${SOME_FLAG:?required}\"\ncargo test\n",
+        )
+        .unwrap();
+        assert_eq!(volatile_reason(&subject, root.path()), None);
         fs::write(&verify, "curl_opts=1\nexport FORGE_TOKEN=x\n").unwrap();
         assert_eq!(
             volatile_reason(&subject, root.path()).as_deref(),
