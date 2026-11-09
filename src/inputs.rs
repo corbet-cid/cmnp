@@ -587,6 +587,11 @@ const AMBIENT_EXCLUDED_PREFIXES: &[&str] = &[
     "WOODPECKER_",
     "GITHUB_",
     "GITLAB_",
+    // The scheduler (Forgejo Actions) and the systemd unit of the runner name
+    // the current run, job and process: never a check input.
+    "FORGEJO_",
+    "ACTIONS_",
+    "RUNNER_",
     "KUBERNETES_",
     "BUILDKIT_",
     "GIT_",
@@ -617,6 +622,63 @@ const AMBIENT_EXCLUDED_NAMES: &[&str] = &[
     "TEMPDIR",
     "NIX_BUILD_TOP",
     "NIX_LOG_FD",
+    // One systemd invocation of the runner service, not the check.
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "SYSTEMD_EXEC_PID",
+    "NOTIFY_SOCKET",
+    "WATCHDOG_PID",
+    "WATCHDOG_USEC",
+    "MANAGERPID",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "LISTEN_FDNAMES",
+];
+
+/// Attributes `nix-shell` exports into the shell it runs. They describe this
+/// shell invocation (and repeat the pinned tool closure the key already binds
+/// through `PATH`), not the check's inputs.
+const NIX_SHELL_ATTRIBUTES: &[&str] = &[
+    "buildInputs",
+    "nativeBuildInputs",
+    "propagatedBuildInputs",
+    "propagatedNativeBuildInputs",
+    "depsBuildBuild",
+    "depsBuildBuildPropagated",
+    "depsBuildHost",
+    "depsBuildTarget",
+    "depsHostHost",
+    "depsHostHostPropagated",
+    "depsTargetTarget",
+    "depsTargetTargetPropagated",
+    "shellHook",
+    "phases",
+    "prePhases",
+    "postPhases",
+    "configurePhase",
+    "buildPhase",
+    "checkPhase",
+    "installPhase",
+    "fixupPhase",
+    "distPhase",
+    "installCheckPhase",
+    "unpackPhase",
+    "patchPhase",
+    "buildFlags",
+    "configureFlags",
+    "cmakeFlags",
+    "makeFlags",
+    "mesonFlags",
+    "ninjaFlags",
+    "patches",
+    "sourceRoot",
+    "name",
+    "system",
+    "out",
+    "outputs",
+    "outputHash",
+    "outputHashAlgo",
+    "outputHashMode",
 ];
 const CREDENTIAL_FRAGMENTS: &[&str] = &[
     "TOKEN",
@@ -675,9 +737,11 @@ pub fn ambient_names(check: &Check, env: &Environment) -> Vec<String> {
                 && !SEMANTIC_ENV.contains(name)
                 && !name.starts_with("CARGO_PROFILE_")
                 && !AMBIENT_EXCLUDED_NAMES.contains(name)
+                && !NIX_SHELL_ATTRIBUTES.contains(name)
                 && !AMBIENT_EXCLUDED_PREFIXES
                     .iter()
                     .any(|p| name.starts_with(p))
+                && !name.contains("_PRESSURE_")
                 && !service_discovery(name)
                 && !CREDENTIAL_FRAGMENTS
                     .iter()
@@ -708,6 +772,42 @@ pub fn semantic_environment(check: &Check, env: &Environment) -> BTreeMap<String
         .collect()
 }
 
+/// Forward the runner's `url.*.insteadOf` rewrites as plumbing.
+///
+/// The land gate serves the commits it is about to push from local mirrors by
+/// setting `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, and the
+/// rendered script appends its own entries. A cached command's dependency
+/// resolution must reach the same objects the key names, so those entries are
+/// passed through (renumbered) but never hashed: the resolved commits are the
+/// semantic input, not the routing that found them. Other Git configuration
+/// (credentials, `safe.directory`, protocol settings) stays out.
+fn forward_instead_of(result: &mut Environment, env: &Environment) {
+    let count = value(env, "GIT_CONFIG_COUNT")
+        .and_then(|text| text.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(1024);
+    let mut entries = Vec::new();
+    for index in 0..count {
+        let key = value(env, &format!("GIT_CONFIG_KEY_{index}"));
+        let value = value(env, &format!("GIT_CONFIG_VALUE_{index}"));
+        let (Some(key), Some(value)) = (key, value) else {
+            continue;
+        };
+        let lowered = key.to_ascii_lowercase();
+        if lowered.starts_with("url.") && lowered.ends_with(".insteadof") {
+            entries.push((key, value));
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    result.insert("GIT_CONFIG_COUNT".into(), entries.len().to_string().into());
+    for (index, (key, value)) in entries.into_iter().enumerate() {
+        result.insert(format!("GIT_CONFIG_KEY_{index}").into(), key.into());
+        result.insert(format!("GIT_CONFIG_VALUE_{index}").into(), value.into());
+    }
+}
+
 /// Runtime plumbing is explicit. Credentials and arbitrary inherited variables
 /// are not handed to cacheable work. Check-specific semantic env is hashed.
 pub fn execution_environment(check: &Check, env: &Environment) -> Environment {
@@ -732,6 +832,7 @@ pub fn execution_environment(check: &Check, env: &Environment) -> Environment {
             result.insert(k.clone(), v.clone());
         }
     }
+    forward_instead_of(&mut result, env);
     result.insert("CCID_CACHE_CHILD".into(), "1".into());
     result
 }
@@ -1055,5 +1156,100 @@ mod tests {
         assert!(!execution_environment(&cargo, &env)
             .contains_key(std::ffi::OsStr::new("SOME_TOOL_HOME")));
         assert!(!semantic_environment(&cargo, &env).contains_key("SOME_TOOL_HOME"));
+    }
+
+    #[test]
+    fn per_run_and_nix_shell_variables_never_enter_the_key() {
+        let check = Check {
+            kind: "commands".into(),
+            ..Check::default()
+        };
+        let mut env = Environment::new();
+        let run = "a".repeat(40);
+        for (name, value) in [
+            ("FORGEJO_RUN_ID", "7"),
+            ("FORGEJO_SHA", run.as_str()),
+            ("ACTIONS_CACHE_URL", "http://cache.invalid"),
+            ("RUNNER_TRACKING_ID", "runner"),
+            ("INVOCATION_ID", "0123456789abcdef"),
+            ("JOURNAL_STREAM", "8:12345"),
+            ("SYSTEMD_EXEC_PID", "42"),
+            ("MEMORY_PRESSURE_WATCH", "/sys/fs/cgroup/memory.pressure"),
+            ("buildInputs", "/nix/store/input"),
+            ("shellHook", "echo entering shell"),
+            ("out", "/nix/store/output"),
+            ("SOME_SEMANTIC_FLAG", "keep"),
+        ] {
+            env.insert(name.into(), value.into());
+        }
+        let keyed = semantic_environment(&check, &env);
+        for name in [
+            "FORGEJO_RUN_ID",
+            "FORGEJO_SHA",
+            "ACTIONS_CACHE_URL",
+            "RUNNER_TRACKING_ID",
+            "INVOCATION_ID",
+            "JOURNAL_STREAM",
+            "SYSTEMD_EXEC_PID",
+            "MEMORY_PRESSURE_WATCH",
+            "buildInputs",
+            "shellHook",
+            "out",
+        ] {
+            assert!(!keyed.contains_key(name), "{name} entered the key");
+        }
+        assert_eq!(
+            keyed["SOME_SEMANTIC_FLAG"].as_deref(),
+            Some("keep"),
+            "a declared semantic variable is still hashed"
+        );
+    }
+
+    #[test]
+    fn git_instead_of_rewrites_reach_cached_work_without_entering_the_key() {
+        let check = Check {
+            kind: "commands".into(),
+            ..Check::default()
+        };
+        let env = Environment::from([
+            ("GIT_CONFIG_COUNT".into(), "3".into()),
+            (
+                "GIT_CONFIG_KEY_0".into(),
+                "url.https://forge.invalid/mirror/.insteadOf".into(),
+            ),
+            (
+                "GIT_CONFIG_VALUE_0".into(),
+                "https://example.invalid/source/".into(),
+            ),
+            ("GIT_CONFIG_KEY_1".into(), "credential.helper".into()),
+            (
+                "GIT_CONFIG_VALUE_1".into(),
+                "store --file=/tmp/secret".into(),
+            ),
+            (
+                "GIT_CONFIG_KEY_2".into(),
+                "URL.https://second.invalid/.INSTEADOF".into(),
+            ),
+            (
+                "GIT_CONFIG_VALUE_2".into(),
+                "ssh://git@example.invalid/".into(),
+            ),
+        ]);
+        let forwarded = execution_environment(&check, &env);
+        assert_eq!(value(&forwarded, "GIT_CONFIG_COUNT").as_deref(), Some("2"));
+        assert_eq!(
+            value(&forwarded, "GIT_CONFIG_KEY_0").as_deref(),
+            Some("url.https://forge.invalid/mirror/.insteadOf")
+        );
+        assert_eq!(
+            value(&forwarded, "GIT_CONFIG_VALUE_1").as_deref(),
+            Some("ssh://git@example.invalid/")
+        );
+        assert!(value(&forwarded, "GIT_CONFIG_KEY_2").is_none());
+        let keyed = semantic_environment(&check, &env);
+        assert!(
+            !keyed.keys().any(|name| name.starts_with("GIT_CONFIG_")),
+            "git routing is plumbing, never a key input"
+        );
     }
 }

@@ -20,6 +20,10 @@ pub mod inputs;
 mod process;
 mod purity;
 
+/// Why a check observes live external state and must not be cached by default.
+/// `ccid cached --plan` reports it without running anything.
+pub use purity::volatile_reason;
+
 fn failure(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
     io::Error::other(message.into()).into()
 }
