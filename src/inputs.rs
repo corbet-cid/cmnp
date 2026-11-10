@@ -576,6 +576,10 @@ const PLUMBING: &[&str] = &[
     // a location or a host spelling names a machine, not the check, so both are forwarded and never keyed.
     "CCID_FLEET_FILE",
     "CCID_FORGE_HOSTS",
+    // Where a cached task finds the resolved locks its key names. The caller keys their digest (`CCID_GIT_RESOLUTION`,
+    // declared environment of the check) and the task verifies the files against it, so the location is forwarded and
+    // never keyed.
+    "CCID_RESOLVED_LOCKS",
 ];
 
 /// Name prefixes and exact names of inherited variables that vary per run, name
@@ -1306,6 +1310,44 @@ mod tests {
             assert_eq!(semantic_environment(&check, &elsewhere), keyed, "{kind}");
             let mut other = env.clone();
             other.insert("CCID_FLEET_DIGEST".into(), "b".repeat(64).into());
+            assert_ne!(semantic_environment(&check, &other), keyed, "{kind}");
+        }
+    }
+
+    #[test]
+    fn resolved_locks_location_is_forwarded_and_never_keyed() {
+        for kind in ["commands", "cargo", "nix", "javascript"] {
+            let check = Check {
+                kind: kind.into(),
+                cache_env: vec!["CCID_GIT_RESOLUTION".into()],
+                ..Check::default()
+            };
+            let env = Environment::from([
+                ("CCID_RESOLVED_LOCKS".into(), "/tmp/run/locks".into()),
+                ("CCID_GIT_RESOLUTION".into(), "a".repeat(64).into()),
+            ]);
+            let forwarded = execution_environment(&check, &env);
+            assert_eq!(
+                value(&forwarded, "CCID_RESOLVED_LOCKS").as_deref(),
+                Some("/tmp/run/locks"),
+                "{kind}: the task finds the locks"
+            );
+            assert_eq!(
+                value(&forwarded, "CCID_GIT_RESOLUTION").as_deref(),
+                Some("a".repeat(64).as_str()),
+                "{kind}: and the digest it verifies them against"
+            );
+            let keyed = semantic_environment(&check, &env);
+            assert!(
+                !keyed.contains_key("CCID_RESOLVED_LOCKS"),
+                "{kind}: the location is never keyed"
+            );
+            // Another location keys the same; another resolution digest does not.
+            let mut elsewhere = env.clone();
+            elsewhere.insert("CCID_RESOLVED_LOCKS".into(), "/other/locks".into());
+            assert_eq!(semantic_environment(&check, &elsewhere), keyed, "{kind}");
+            let mut other = env.clone();
+            other.insert("CCID_GIT_RESOLUTION".into(), "b".repeat(64).into());
             assert_ne!(semantic_environment(&check, &other), keyed, "{kind}");
         }
     }
