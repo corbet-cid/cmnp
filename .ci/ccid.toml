@@ -8,7 +8,7 @@ kind = "cargo"
 
 [jobs.verify]
 scheduler = "forgejo"
-runs_on = "heavy"
+runs_on = "linux"
 checks = ["test"]
 workflow = "ci"
 command = ["bash", ".ci/run-job.sh"]
