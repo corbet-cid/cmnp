@@ -662,12 +662,50 @@ fn tool_identity(
     Ok(format!("{:x}", Sha256::digest(parts.join("\n").as_bytes())))
 }
 
-fn render_workspace(project: &str) -> String {
+/// The base ref moon diffs against: derived from the repository, never a constant. moon's own default is `master`, which a repository whose branch is `main`
+/// (or a shallow job checkout with no branch at all) does not have, and `git diff master` then exits 128. Order: the remote's default branch
+/// (`refs/remotes/origin/HEAD`), the checked-out branch, then `HEAD` itself (an empty diff, always resolvable). Each candidate must resolve.
+pub(crate) fn default_branch(root: &std::path::Path) -> String {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .filter(|s| !s.is_empty())
+    };
+    [
+        git(&[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ]),
+        git(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|name| {
+        git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{name}^{{commit}}"),
+        ])
+        .is_some()
+    })
+    .unwrap_or_else(|| "HEAD".to_owned())
+}
+
+fn render_workspace(project: &str, default_branch: &str) -> String {
     let mut projects = serde_json::Map::new();
     projects.insert(project.to_owned(), json!("."));
     let workspace = json!({
         "projects": projects,
-        "vcs": { "client": "git" },
+        "vcs": { "client": "git", "defaultBranch": default_branch },
     });
     // YAML is a superset of JSON, so the generated JSON is valid moon YAML.
     format!(
@@ -727,6 +765,80 @@ fn write_generated(path: &Path, content: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init", "-q", "-b", "trunk"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "i",
+        ]);
+        dir
+    }
+
+    #[test]
+    fn default_branch_is_derived_from_the_repository() {
+        let dir = repo();
+        assert_eq!(default_branch(dir.path()), "trunk");
+        // detached (a job checkout fetched by sha): nothing named exists, HEAD always resolves
+        let sha = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["checkout", "-q", "--detach", sha.trim()])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(default_branch(dir.path()), "HEAD");
+        // the remote's default branch wins when it resolves
+        assert!(std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", sha.trim()])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args([
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main"
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(default_branch(dir.path()), "origin/main");
+        let rendered: serde_json::Value = serde_json::from_str(
+            render_workspace("p", &default_branch(dir.path()))
+                .split_once('\n')
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        assert_eq!(rendered["vcs"]["defaultBranch"], "origin/main");
+    }
+
     #[test]
     fn current_and_legacy_moon_versions_are_supported() {
         assert!(supported_moon("moon 2.4.6"));
@@ -768,7 +880,8 @@ mod tests {
     #[test]
     fn workspace_is_independent_of_remote_transport() {
         let local: serde_json::Value =
-            serde_json::from_str(render_workspace("demo").split_once('\n').unwrap().1).unwrap();
+            serde_json::from_str(render_workspace("demo", "main").split_once('\n').unwrap().1)
+                .unwrap();
         assert_eq!(local["projects"]["demo"], ".");
         assert!(local.get("remote").is_none());
     }

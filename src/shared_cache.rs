@@ -273,7 +273,7 @@ pub(super) fn execute(request: &Request, prepared: CachePreflight) -> Result<()>
         }
         write_generated(
             &root.join(".moon/workspace.yml"),
-            &render_workspace(&request.project),
+            &render_workspace(&request.project, &crate::executor::default_branch(&root)),
         )?;
         write_generated(
             &root.join("moon.yml"),
