@@ -440,7 +440,7 @@ impl Guard {
             key: self.key.clone(),
             attempts,
             status: Status::Running,
-            producer: None,
+            producer: Some(owner_identity()),
         };
         write_state(&self.state_path, &state)?;
         self.started = true;
@@ -578,11 +578,29 @@ pub fn acquire(root: &Path, key: &str, timeout: Duration) -> Result<Guard> {
             "Single-flight acquisition interrupted or deadline exceeded",
         ));
     }
+    let mut observed = observed;
     if let Some(state) = &observed {
         if matches!(state.status, Status::Running) {
-            return Err(refusal(
-                "Unresolved running record; refuse new compute until reconciliation proves old children are gone",
-            ));
+            // This process holds the key's lock, so the process that wrote the
+            // record is not computing any more (the owner holds the lock for
+            // its whole compute, and the lock is not inherited by children).
+            // The record is reconciled only when its owner identity also shows
+            // that nothing it started can still be running; the result of the
+            // dead attempt is never reused (it becomes Failed).
+            match owner_gone(state.producer.as_deref()) {
+                Ok(proof) => {
+                    let mut failed = state.clone();
+                    failed.status = Status::Failed;
+                    failed.producer = Some(format!("reconciled: {proof}"));
+                    write_state(&state_path, &failed)?;
+                    observed = Some(failed);
+                }
+                Err(why) => {
+                    return Err(refusal(format!(
+                        "Unresolved running record; refuse new compute until reconciliation proves old children are gone ({why})"
+                    )))
+                }
+            }
         }
     }
     Ok(Guard {
@@ -594,6 +612,83 @@ pub fn acquire(root: &Path, key: &str, timeout: Duration) -> Result<Guard> {
         running_attempts: None,
         start_deadline: deadline,
     })
+}
+
+/// Identity of the running owner, written into the Running record:
+/// `owner-v1 pid=<pid> start=<start token> cg=<cgroup path or ->`.
+fn owner_identity() -> String {
+    let pid = std::process::id();
+    format!(
+        "owner-v1 pid={pid} start={} cg={}",
+        process_start(pid).unwrap_or_else(|| "-".into()),
+        own_cgroup().unwrap_or_else(|| "-".into())
+    )
+}
+
+/// A token that changes when a pid is reused: the kernel start time on Linux,
+/// the `ps` start stamp elsewhere.
+fn process_start(pid: u32) -> Option<String> {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // Fields after the parenthesised name; starttime is field 22 overall.
+        let rest = stat.get(stat.rfind(')')? + 1..)?;
+        return rest.split_whitespace().nth(19).map(str::to_owned);
+    }
+    let out = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .replace(' ', "_");
+    (out.status.success() && !text.is_empty()).then_some(text)
+}
+
+/// The cgroup v2 path of this process (Linux), if any.
+fn own_cgroup() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = text.lines().find_map(|l| l.strip_prefix("0::"))?;
+    (!path.is_empty() && !path.contains(char::is_whitespace)).then(|| path.to_owned())
+}
+
+/// Whether the owner named by a Running record's `producer` is provably gone
+/// with everything it started. `Ok` carries the proof; `Err` the reason it is
+/// not proven. A record without an owner identity (written before it existed)
+/// has only the free lock as proof, which is accepted: the owner held the lock
+/// through its whole compute and reaped its process group on exit.
+fn owner_gone(producer: Option<&str>) -> std::result::Result<String, String> {
+    let Some(text) = producer.and_then(|p| p.strip_prefix("owner-v1 ")) else {
+        return Ok("legacy record, lock free".into());
+    };
+    let field = |name: &str| {
+        text.split_whitespace()
+            .find_map(|part| part.strip_prefix(name))
+            .map(str::to_owned)
+    };
+    let pid: u32 = field("pid=")
+        .and_then(|p| p.parse().ok())
+        .ok_or("owner pid unreadable")?;
+    let start = field("start=").unwrap_or_else(|| "-".into());
+    if pid == std::process::id()
+        || matches!(process_start(pid), Some(now) if start == "-" || now == start)
+    {
+        return Err(format!("owner pid {pid} is still alive"));
+    }
+    if let Some(cg) = field("cg=").filter(|c| c != "-" && c.starts_with('/')) {
+        if own_cgroup().as_deref() != Some(cg.as_str()) {
+            let procs = std::path::Path::new("/sys/fs/cgroup")
+                .join(cg.trim_start_matches('/'))
+                .join("cgroup.procs");
+            match std::fs::read_to_string(&procs) {
+                Ok(list) if !list.trim().is_empty() => {
+                    return Err(format!("cgroup {cg} still holds processes"))
+                }
+                Ok(_) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(format!("cgroup {cg} unreadable: {e}")),
+            }
+        }
+    }
+    Ok(format!("owner pid {pid} and its cgroup are gone"))
 }
 
 #[cfg(test)]
@@ -623,6 +718,89 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.downcast_ref::<LedgerRefusal>().is_some());
+    }
+
+    fn write_running(dir: &Path, key: &str, producer: Option<&str>) {
+        let state = AttemptState {
+            schema: SCHEMA,
+            key: key.to_owned(),
+            attempts: 1,
+            status: Status::Running,
+            producer: producer.map(str::to_owned),
+        };
+        std::fs::write(
+            dir.join(format!("{key}.json")),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dead_owner_record_is_reconciled_then_computes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = fixture().key_hex().unwrap();
+        // Pid 0x7fffffff never exists; the cgroup is absent.
+        write_running(
+            dir.path(),
+            &key,
+            Some("owner-v1 pid=2147483646 start=1 cg=/ccid-test-gone.scope"),
+        );
+        let mut guard = acquire(dir.path(), &key, Duration::from_secs(5)).unwrap();
+        assert!(matches!(guard.observed().unwrap().status, Status::Failed));
+        assert!(!guard.started());
+        let state = guard.begin_compute().unwrap();
+        assert_eq!(state.attempts, 2);
+        // A second run while the first holds the key never computes alongside it.
+        assert!(acquire(dir.path(), &key, Duration::from_millis(80)).is_err());
+        guard.publish_success(None).unwrap();
+        let hit = acquire(dir.path(), &key, Duration::from_secs(5)).unwrap();
+        assert!(hit.observed_success().is_some());
+    }
+
+    #[test]
+    fn legacy_record_with_free_lock_is_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = fixture().key_hex().unwrap();
+        write_running(dir.path(), &key, None);
+        let guard = acquire(dir.path(), &key, Duration::from_secs(5)).unwrap();
+        assert!(matches!(guard.observed().unwrap().status, Status::Failed));
+    }
+
+    #[test]
+    fn live_owner_or_populated_cgroup_is_not_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = fixture().key_hex().unwrap();
+        let me = std::process::id();
+        let start = process_start(me).unwrap_or_else(|| "-".into());
+        write_running(
+            dir.path(),
+            &key,
+            Some(&format!("owner-v1 pid={me} start={start} cg=-")),
+        );
+        let error = acquire(dir.path(), &key, Duration::from_secs(5))
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<LedgerRefusal>().is_some());
+        // Pid reuse: same pid, different start token is a dead owner.
+        write_running(
+            dir.path(),
+            &key,
+            Some(&format!("owner-v1 pid={me} start=1 cg=-")),
+        );
+        if process_start(me).is_some() && start != "1" {
+            // Still refused: this very process is the live holder of the pid.
+            assert!(acquire(dir.path(), &key, Duration::from_secs(5)).is_err());
+        }
+        let root_procs = std::fs::read_to_string("/sys/fs/cgroup/cgroup.procs").unwrap_or_default();
+        if !root_procs.trim().is_empty() && own_cgroup().as_deref() != Some("/") {
+            // A populated cgroup that is not ours is not proof of anything.
+            write_running(
+                dir.path(),
+                &key,
+                Some("owner-v1 pid=2147483646 start=1 cg=/"),
+            );
+            assert!(acquire(dir.path(), &key, Duration::from_secs(5)).is_err());
+        }
     }
 
     #[test]
