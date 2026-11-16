@@ -580,6 +580,10 @@ const PLUMBING: &[&str] = &[
     // declared environment of the check) and the task verifies the files against it, so the location is forwarded and
     // never keyed.
     "CCID_RESOLVED_LOCKS",
+    // The machine's heavy-eval lock file (infra tools/heavy-lock: `HEAVY_LOCK`, else the CI runner slot's own pool file `CCID_HEAVY_LOCK`). A tool a check runs takes the same lock the
+    // caller would, so the name is forwarded; it names a machine and a slot, not the check, so it is never keyed (a per-slot value would otherwise give every slot its own cache key).
+    "CCID_HEAVY_LOCK",
+    "HEAVY_LOCK",
 ];
 
 /// Name prefixes and exact names of inherited variables that vary per run, name
@@ -1311,6 +1315,36 @@ mod tests {
             let mut other = env.clone();
             other.insert("CCID_FLEET_DIGEST".into(), "b".repeat(64).into());
             assert_ne!(semantic_environment(&check, &other), keyed, "{kind}");
+        }
+    }
+
+    #[test]
+    fn heavy_lock_files_are_forwarded_and_never_keyed() {
+        for kind in ["commands", "cargo", "nix", "javascript"] {
+            let check = Check {
+                kind: kind.into(),
+                ..Check::default()
+            };
+            let env_for = |pool: &str| {
+                Environment::from([
+                    ("CCID_HEAVY_LOCK".into(), pool.into()),
+                    ("HEAVY_LOCK".into(), pool.into()),
+                ])
+            };
+            let (a, b) = (env_for("/caches/locks/ci-0.lock"), env_for("/caches/locks/ci-1.lock"));
+            let forwarded = execution_environment(&check, &a);
+            for name in ["CCID_HEAVY_LOCK", "HEAVY_LOCK"] {
+                assert_eq!(
+                    value(&forwarded, name).as_deref(),
+                    Some("/caches/locks/ci-0.lock"),
+                    "{kind}: {name}"
+                );
+            }
+            assert_eq!(
+                semantic_environment(&check, &a),
+                semantic_environment(&check, &b),
+                "{kind}: another slot's pool file keys the same"
+            );
         }
     }
 
