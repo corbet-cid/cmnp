@@ -17,15 +17,18 @@ jobs:
         run: |
           set -eu
           # The ccid release this job runs is chosen centrally: the runner names a channel file (CCID_CHANNEL_URL: {"default": {"revision", "sha256"}, "classes": {"<runs-on>": {...}}})
-          # and a tool root (CCID_TOOL_ROOT). This step only finds that release and hands over to `ccid job-run`, which holds the actual job logic. It never needs a change.
+          # and a tool root (CCID_TOOL_ROOT). This step only finds that release, checks the binary's sha256 against the channel entry on every run, and hands over to `ccid job-run`, which holds the actual job logic.
           triple="${CCID_TOOL_TRIPLE:-$(uname -m)-unknown-linux-gnu}"
           : "${CCID_TOOL_ROOT:?the runner must provide CCID_TOOL_ROOT}"
+          # The sha256 of a file, with the tool the runner has: GNU sha256sum, or shasum on a BSD userland. An unreadable file gives an empty answer, which equals no digest.
+          sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum 2>/dev/null <"$1"; else shasum -a 256 2>/dev/null <"$1"; fi | cut -d' ' -f1; }
           class='linux'
           state="${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/ccid-channel"
           mkdir -p "$state" 2>/dev/null || true
           chan=
           if [ -n "${CCID_CHANNEL_URL:-}" ]; then
-            chan=$(curl --fail --silent --show-error --location --max-time 30 --retry 3 -H "Authorization: token $CCID_FORGE_TOKEN" "$CCID_CHANNEL_URL" 2>/dev/null || true)
+            # -q first: curl reads no ~/.curlrc, a file every job of the runner can write (a proxy there could fail this fetch over to the job-writable channel copy below, or read the token).
+            chan=$(curl -q --fail --silent --show-error --location --max-time 30 --retry 3 -H "Authorization: token $CCID_FORGE_TOKEN" "$CCID_CHANNEL_URL" 2>/dev/null || true)
             # Atomic: a concurrent job reading the copy never sees it half written (a temporary file in the same directory, then a rename).
             if [ -n "$chan" ] && part=$(mktemp "$state/last-good.json.XXXXXX" 2>/dev/null); then if printf '%s' "$chan" > "$part" 2>/dev/null; then mv -f "$part" "$state/last-good.json" 2>/dev/null || rm -f "$part" || true; else rm -f "$part" || true; fi; fi
           fi
@@ -47,12 +50,15 @@ jobs:
               [ -n "${CCID_TOOL_URL:-}" ] && [ -n "$sha256" ] && [ "$sha256" != null ] || { echo "ccid $revision is not provisioned and cannot be fetched" >&2; exit 2; }
               # Concurrent jobs fetch the same release: each into a temp file of its own, the rename is atomic and the content is the pinned digest either way.
               part=$(mktemp "$tool.XXXXXX")
-              curl --fail --silent --show-error --location "$CCID_TOOL_URL/$revision/ccid-$triple" --output "$part"
-              echo "$sha256  $part" | sha256sum --check --strict
+              curl -q --fail --silent --show-error --location "$CCID_TOOL_URL/$revision/ccid-$triple" --output "$part"
+              [ "$(sha256_of "$part")" = "$sha256" ] || { rm -f "$part"; echo "ccid $revision from $CCID_TOOL_URL does not match sha256 $sha256" >&2; exit 2; }
               chmod 0555 "$part"
               mv -f "$part" "$tool"
             fi
           fi
+          # Checked on EVERY run, not only after a download: a copy in the runner's own cache is a file other jobs can rewrite, and this binary is about to run holding the job token. No digest, no run.
+          { [ -n "$sha256" ] && [ "$sha256" != null ]; } || { echo "the channel names no sha256 for ccid $revision: refusing to run an unverified binary" >&2; exit 2; }
+          [ "$(sha256_of "$tool")" = "$sha256" ] || { echo "ccid at $tool does not match sha256 $sha256 of the channel entry for $revision: refusing to run it" >&2; exit 2; }
           test "$("$tool" source-revision)" = "$revision" || { echo "ccid at $tool is not $revision" >&2; exit 2; }
           exec "$tool" job-run --job 'verify' --repository '${{ github.repository }}' --sha '${{ github.sha }}' --server-url '${{ github.server_url }}' --owner '${{ github.repository_owner }}'
       - name: Archive the locked flake inputs
