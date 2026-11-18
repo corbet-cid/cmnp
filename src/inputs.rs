@@ -1331,7 +1331,10 @@ mod tests {
                     ("HEAVY_LOCK".into(), pool.into()),
                 ])
             };
-            let (a, b) = (env_for("/caches/locks/ci-0.lock"), env_for("/caches/locks/ci-1.lock"));
+            let (a, b) = (
+                env_for("/caches/locks/ci-0.lock"),
+                env_for("/caches/locks/ci-1.lock"),
+            );
             let forwarded = execution_environment(&check, &a);
             for name in ["CCID_HEAVY_LOCK", "HEAVY_LOCK"] {
                 assert_eq!(
