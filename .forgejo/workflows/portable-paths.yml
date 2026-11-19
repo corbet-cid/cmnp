@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
 jobs:
   portable-paths:
-    runs-on: light
+    runs-on: linux
     steps:
       - name: Run portable-paths
         env:
@@ -25,7 +25,7 @@ jobs:
           : "${CCID_TOOL_ROOT:?the runner must provide CCID_TOOL_ROOT}"
           # The sha256 of a file, with the tool the runner has: GNU sha256sum, or shasum on a BSD userland. An unreadable file gives an empty answer, which equals no digest.
           sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum 2>/dev/null <"$1"; else shasum -a 256 2>/dev/null <"$1"; fi | cut -d' ' -f1; }
-          class='light'
+          class='linux'
           state="${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/ccid-channel"
           mkdir -p "$state" 2>/dev/null || true
           chan=

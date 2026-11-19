@@ -13,7 +13,8 @@
       "workflow": "portable-paths",
       "command": [
         "ccid:run-declared-checks"
-      ]
+      ],
+      "runs_on": "linux"
     },
     "verify": {
       "job": "verify",
